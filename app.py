@@ -441,29 +441,29 @@ if compare_clicked:
                     st.markdown("---")
                     st.markdown("### Discrepancy Report (Non-Tabular)")
                     
-                    res_html = f'''<div class="results-text">
-                    <div class="results-text-title">Text component:</div>
-                    Added: {", ".join(added_text) if added_text else "None"}<br>
-                    Misplaced: N/A (Visual tracking via green boxes above)<br>
-                    Deleted: {", ".join(deleted_text) if deleted_text else "None"}<br>
-
-                    <div class="results-text-title">Symbol component:</div>
-                    Added: {", ".join(added_syms) if added_syms else "None"}<br>
-                    Misplaced: {", ".join(misplaced_syms) if misplaced_syms else "None"}<br>
-                    Deleted: {", ".join(removed_syms) if removed_syms else "None"}<br>
-
-                    <div class="results-text-title">Barcode component:</div>
-                    Added: {", ".join(added_bc) if added_bc else "None"}<br>
-                    Misplaced: None<br>
-                    Deleted: {", ".join(deleted_bc) if deleted_bc else "None"}<br>
-
-                    <div class="results-text-title">Image component:</div>
-                    Added: {", ".join(added_img) if added_img else "None"}<br>
-                    Misplaced: None<br>
-                    Deleted: {", ".join(deleted_img) if deleted_img else "None"}<br>
-                    </div>'''
+                    res_md = f"""
+                    **Text component:**
+                    * **Added:** {", ".join(added_text) if added_text else "None"}
+                    * **Misplaced:** N/A (Visual tracking via green boxes above)
+                    * **Deleted:** {", ".join(deleted_text) if deleted_text else "None"}
                     
-                    st.markdown(res_html, unsafe_allow_html=True)
+                    **Symbol component:**
+                    * **Added:** {", ".join(added_syms) if added_syms else "None"}
+                    * **Misplaced:** {", ".join(misplaced_syms) if misplaced_syms else "None"}
+                    * **Deleted:** {", ".join(removed_syms) if removed_syms else "None"}
+                    
+                    **Barcode component:**
+                    * **Added:** {", ".join(added_bc) if added_bc else "None"}
+                    * **Misplaced:** None
+                    * **Deleted:** {", ".join(deleted_bc) if deleted_bc else "None"}
+                    
+                    **Image component:**
+                    * **Added:** {", ".join(added_img) if added_img else "None"}
+                    * **Misplaced:** None
+                    * **Deleted:** {", ".join(deleted_img) if deleted_img else "None"}
+                    """
+                    
+                    st.markdown(res_md)
             status.update(label="Deep Analysis Complete!", state="complete", expanded=False)
 
     else:
