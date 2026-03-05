@@ -9,22 +9,17 @@ from skimage.metrics import structural_similarity as ssim
 import imutils
 import math
 
-# --- NEW DEPENDENCY FOR FUZZY MATCHING ---
 from rapidfuzz import fuzz
-
-# External imports from your ML modules (ensure extractor.py is present)
 from detect import run_detection_pil, get_center
+
 try:
     from Extract import extract_all_features
 except ImportError as e:
-    # Fallback if extractor isn't ready or if OpenCV headless is missing
     st.error(f"Error loading external module: {e}")
     st.stop()
 
-# Page configuration
 st.set_page_config(layout="wide", page_title="Label Comparator")
 
-# CSS and general layout functions
 st.markdown("""
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&display=swap');
@@ -52,7 +47,7 @@ def pdf_to_image(uploaded_file, dpi=200):
     pdf_document.close()
     return image
 
-def process_upload(uploaded_file, max_width=1500):
+def process_upload(uploaded_file, max_width=1000):
     if uploaded_file is None:
         return None
     if uploaded_file.name.lower().endswith(".pdf"):
@@ -62,7 +57,6 @@ def process_upload(uploaded_file, max_width=1500):
         if img.mode != 'RGB':
             img = img.convert('RGB')
             
-    # Resize if the image is massive to save processing time
     if img.width > max_width:
         ratio = max_width / float(img.width)
         new_height = int((float(img.height) * float(ratio)))
@@ -70,7 +64,6 @@ def process_upload(uploaded_file, max_width=1500):
         
     return img
 
-# --- Image Processing ---
 def preprocess_image(image, resize_to=None, enhance_contrast=False):
     if image is None: return None
     img = image.copy()
@@ -155,7 +148,6 @@ def filter_text_boxes(text_boxes, symbol_boxes):
             filtered.append((x, y, w, h))
     return filtered
 
-# --- Visualization ---
 def draw_differences(image, bounding_boxes, color=(255, 0, 0), thickness=2, label=""):
     img_with_boxes = image.copy()
     draw = ImageDraw.Draw(img_with_boxes)
@@ -184,7 +176,6 @@ def draw_symbol_boxes(image, detections, color_map=None, thickness=2):
         draw.text((x1, max(0, y1-15)), label, fill=color)
     return img_with_boxes
 
-# --- Helper for Diffing Features with NEW FUZZY LOGIC ---
 def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=95):
     if base_df.empty or comp_df.empty:
         return [], []
@@ -224,7 +215,6 @@ def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=95):
 
     return added, deleted
 
-# --- Main App ---
 
 st.markdown('<h1 class="main-header">LABEL COMPARATOR PRO</h1>', unsafe_allow_html=True)
 
@@ -242,14 +232,15 @@ st.write("")
 
 if compare_clicked:
     if base_file is not None and child_files:
-        with st.status("Analyzing labels at deep level...", expanded=True) as status:
+        with st.status("Analyzing labels securely...", expanded=True) as status:
             
-            status.write("Processing base document and extracting features...")
+            status.write("Processing base document...")
             raw_base_img = process_upload(base_file)
             base_processed = preprocess_image(raw_base_img, enhance_contrast=False)
-            base_symbols_raw = run_detection_pil(base_processed)
             
-            base_features_df = extract_all_features(raw_base_img, logo_folder="logos")
+            # Run YOLO once and pass it down
+            base_symbols_raw = run_detection_pil(base_processed)
+            base_features_df = extract_all_features(raw_base_img, base_symbols_raw, logo_folder="logos")
             
             base_symbols = []
             for d in base_symbols_raw:
@@ -265,11 +256,13 @@ if compare_clicked:
                     raw_child_img = process_upload(child_file)
                     comp_processed = preprocess_image(raw_child_img, enhance_contrast=False)
                     
-                    comp_features_df = extract_all_features(raw_child_img, logo_folder="logos")
-                    
                     comp_aligned, aligned_success = align_images(base_processed, comp_processed)
                     if not aligned_success:
                         comp_aligned = comp_processed
+                    
+                    # Run YOLO on child once and pass it down
+                    comp_symbols_raw = run_detection_pil(comp_aligned)
+                    comp_features_df = extract_all_features(comp_aligned, comp_symbols_raw, logo_folder="logos")
                         
                     diff_results = find_differences(base_processed, comp_aligned, threshold=0.85, min_area=150)
                     
@@ -277,7 +270,6 @@ if compare_clicked:
                         st.error(f"Error comparing '{child_file.name}'")
                         continue
                         
-                    comp_symbols_raw = run_detection_pil(comp_aligned)
                     comp_symbols_final = []
                     
                     def region_has_symbol(image, bbox, threshold=15):
@@ -428,7 +420,7 @@ if compare_clicked:
                     else:
                         st.success("✅ No discrepancies found! The labels match perfectly.")
                         
-            status.update(label="Deep Analysis Complete!", state="complete", expanded=False)
+            status.update(label="Analysis Complete!", state="complete", expanded=False)
 
     else:
         st.error("Please ensure both the Base Label and at least one Child Label are uploaded.")
