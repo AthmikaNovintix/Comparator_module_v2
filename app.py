@@ -323,6 +323,11 @@ if compare_clicked:
                         non_bg = np.sum(crop_gray < 240)
                         return non_bg > threshold
 
+                    # Dynamic threshold: 4% of the image's total width
+                    # This makes the app immune to different resolutions/sizes!
+                    dynamic_threshold = base_processed.width * 0.04 
+
+                    # 1. Check for Misplaced and Removed
                     for base_sym in base_symbols_raw:
                         matches = [c for c in comp_symbols_raw if c["class"] == base_sym["class"]]
                         if matches:
@@ -330,7 +335,8 @@ if compare_clicked:
                                 c1 = get_center(base_sym["bbox"])
                                 c2 = get_center(match["bbox"])
                                 dist = math.dist(c1, c2)
-                                if dist > 40: 
+                                
+                                if dist > dynamic_threshold: 
                                     if region_has_symbol(comp_aligned, match["bbox"]):
                                         misplaced_box = match.copy()
                                         misplaced_box["label"] = "Misplaced"
@@ -340,12 +346,14 @@ if compare_clicked:
                             missing_box["label"] = "Removed"
                             comp_symbols_final.append(missing_box)
                             
+                    # 2. Check for newly Added symbols
                     for d in comp_symbols_raw:
                         if d["class"] not in [b["class"] for b in base_symbols_raw]:
                             added_box = d.copy()
                             added_box["label"] = "Added"
                             comp_symbols_final.append(added_box)
                             
+                    # Save final results
                     comp_symbols = comp_symbols_final
                     
                     ssim_boxes = diff_results['bounding_boxes']
