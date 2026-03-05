@@ -8,6 +8,8 @@ import numpy as np
 from skimage.metrics import structural_similarity as ssim
 import imutils
 import math
+import pytesseract
+import re
 
 from rapidfuzz import fuzz
 from detect import run_detection_pil, get_center
@@ -176,7 +178,7 @@ def draw_symbol_boxes(image, detections, color_map=None, thickness=2):
         draw.text((x1, max(0, y1-15)), label, fill=color)
     return img_with_boxes
 
-def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=95):
+def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=85):
     if base_df.empty or comp_df.empty:
         return [], []
     
@@ -193,11 +195,12 @@ def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=95):
         deleted = list(base_set - comp_set)
         return added, deleted
 
+    # Smarter token-based matching to ignore OCR noise
     for b_val in base_vals_list:
         match_found = False
         norm_b = b_val.lower().strip() 
         for c_val in comp_vals_list:
-            if fuzz.ratio(norm_b, c_val.lower().strip()) >= fuzzy_threshold:
+            if fuzz.token_set_ratio(norm_b, c_val.lower().strip()) >= fuzzy_threshold:
                 match_found = True
                 break
         if not match_found:
@@ -207,7 +210,7 @@ def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=95):
         match_found = False
         norm_c = c_val.lower().strip() 
         for b_val in base_vals_list:
-            if fuzz.ratio(norm_c, b_val.lower().strip()) >= fuzzy_threshold:
+            if fuzz.token_set_ratio(norm_c, b_val.lower().strip()) >= fuzzy_threshold:
                 match_found = True
                 break
         if not match_found:
@@ -215,6 +218,31 @@ def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=95):
 
     return added, deleted
 
+def ocr_crop(image, box):
+    """Extracts text ONLY from the exact physical area that changed"""
+    x, y, w, h = box
+    pad = 5
+    
+    img_width = image.shape[1] if isinstance(image, np.ndarray) else image.width
+    img_height = image.shape[0] if isinstance(image, np.ndarray) else image.height
+    
+    x1, y1 = max(0, x-pad), max(0, y-pad)
+    x2, y2 = min(img_width, x+w+pad), min(img_height, y+h+pad)
+    
+    crop = np.array(image)[y1:y2, x1:x2]
+    if crop.size == 0: return ""
+    
+    if len(crop.shape) == 3: gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    else: gray = crop
+        
+    gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    text = pytesseract.image_to_string(gray, lang='eng+fra+deu', config='--psm 6').strip()
+    
+    text = re.sub(r'[|><_~=«»"*;]', '', text).strip()
+    text = re.sub(r'\n+', ' ', text) 
+    return text
+
+# --- Main App ---
 
 st.markdown('<h1 class="main-header">LABEL COMPARATOR PRO</h1>', unsafe_allow_html=True)
 
@@ -377,7 +405,27 @@ if compare_clicked:
                         st.markdown("**Child Features**")
                         st.dataframe(comp_features_df, use_container_width=True, hide_index=True)
 
-                    added_text, deleted_text = get_feature_diffs(base_features_df, comp_features_df, 'Text', fuzzy_threshold=95)
+                    # ---------------------------------------------------------
+                    # THE GOLDEN FIX: VISUALLY-DRIVEN TEXT DISCREPANCIES
+                    # ---------------------------------------------------------
+                    added_text = []
+                    for box in actual_added_boxes:
+                        txt = ocr_crop(comp_aligned, box)
+                        if txt and len(txt) > 2: added_text.append(txt)
+
+                    deleted_text = []
+                    for box in actual_deleted_boxes:
+                        txt = ocr_crop(base_processed, box)
+                        if txt and len(txt) > 2: deleted_text.append(txt)
+
+                    modified_text = []
+                    for box in changed_boxes:
+                        txt_b = ocr_crop(base_processed, box)
+                        txt_c = ocr_crop(comp_aligned, box)
+                        if txt_b or txt_c:
+                            modified_text.append(f"From: '{txt_b}' ➔ To: '{txt_c}'")
+
+                    # Get Exact matches for Barcodes and Images (Fuzzy matching disabled for these)
                     added_bc, deleted_bc = get_feature_diffs(base_features_df, comp_features_df, 'Barcode')
                     added_img, deleted_img = get_feature_diffs(base_features_df, comp_features_df, 'Image')
 
@@ -392,6 +440,7 @@ if compare_clicked:
                     
                     for item in added_text: diff_data.append({"Category": "Text", "Status": "Added", "Value": item})
                     for item in deleted_text: diff_data.append({"Category": "Text", "Status": "Deleted", "Value": item})
+                    for item in modified_text: diff_data.append({"Category": "Text", "Status": "Modified", "Value": item})
                     
                     for item in added_syms: diff_data.append({"Category": "Symbol", "Status": "Added", "Value": item})
                     for item in misplaced_syms: diff_data.append({"Category": "Symbol", "Status": "Misplaced", "Value": item})
@@ -413,6 +462,8 @@ if compare_clicked:
                                 return ['background-color: rgba(220, 53, 69, 0.2); color: #721c24'] * len(row)
                             elif row['Status'] == 'Misplaced':
                                 return ['background-color: rgba(255, 193, 7, 0.2); color: #856404'] * len(row)
+                            elif row['Status'] == 'Modified':
+                                return ['background-color: rgba(23, 162, 184, 0.2); color: #0c5460'] * len(row)
                             return [''] * len(row)
                         
                         styled_df = diff_df.style.apply(highlight_status, axis=1)
