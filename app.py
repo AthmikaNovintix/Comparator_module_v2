@@ -1,17 +1,18 @@
 import streamlit as st
 import pandas as pd
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps, ImageEnhance
 import fitz  # PyMuPDF
 import io
 import cv2
 import numpy as np
-import pytesseract
-from pytesseract import Output
-import re
+from skimage.metrics import structural_similarity as ssim
+import imutils
 import math
+import pytesseract
+import re
 
 from rapidfuzz import fuzz
-from detect import run_detection_pil
+from detect import run_detection_pil, get_center
 
 try:
     from Extract import extract_all_features
@@ -19,7 +20,7 @@ except ImportError as e:
     st.error(f"Error loading external module: {e}")
     st.stop()
 
-st.set_page_config(layout="wide", page_title="Label Comparator Pro")
+st.set_page_config(layout="wide", page_title="Label Comparator")
 
 st.markdown("""
     <style>
@@ -29,12 +30,10 @@ st.markdown("""
         .main-header { text-align: center; color: #064b75 !important; font-weight: 700; padding-bottom: 30px; }
         div.stButton > button { background-color: #f4a303 !important; color: #ffffff !important; border: none; border-radius: 5px; font-size: 16px; font-weight: bold; padding: 10px 24px; }
         div.stButton > button:hover { background-color: #e09600 !important; color: white !important; }
+        [data-testid="stFileUploader"] { background-color: #ffffff; border: 1px solid #dee2e6; border-radius: 8px; padding: 10px; }
     </style>
 """, unsafe_allow_html=True)
 
-# -------------------------------------------------------------------
-# 1. IMAGE PROCESSING
-# -------------------------------------------------------------------
 def pdf_to_image(uploaded_file, dpi=200):
     pdf_bytes = uploaded_file.read()
     uploaded_file.seek(0)
@@ -45,175 +44,196 @@ def pdf_to_image(uploaded_file, dpi=200):
     pix = first_page.get_pixmap(matrix=mat, alpha=False)
     img_data = pix.tobytes("png")
     image = Image.open(io.BytesIO(img_data))
-    if image.mode != 'RGB': image = image.convert('RGB')
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
     pdf_document.close()
     return image
 
-def process_upload(uploaded_file, target_width=1200):
-    if uploaded_file is None: return None
+def process_upload(uploaded_file, target_width=1000):
+    if uploaded_file is None:
+        return None
     if uploaded_file.name.lower().endswith(".pdf"):
         img = pdf_to_image(uploaded_file)
     else:
         img = Image.open(uploaded_file)
-        if img.mode != 'RGB': img = img.convert('RGB')
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
             
+    # STRICT STANDARDIZATION: Force every image to exactly 1000px wide
+    # This prevents all cross-scale coordinate mismatch bugs
     ratio = target_width / float(img.width)
     new_height = int((float(img.height) * float(ratio)))
-    return img.resize((target_width, new_height), Image.Resampling.LANCZOS)
+    img = img.resize((target_width, new_height), Image.Resampling.LANCZOS)
+        
+    return img
 
-# -------------------------------------------------------------------
-# 2. SEMANTIC TEXT EXTRACTION (Layout Agnostic)
-# -------------------------------------------------------------------
-@st.cache_data
-def get_text_blocks(_image):
-    """Extracts text and absolute bounding boxes independent of image size"""
-    gray = cv2.cvtColor(np.array(_image), cv2.COLOR_RGB2GRAY)
+def preprocess_image(image, resize_to=None, enhance_contrast=False):
+    if image is None: return None
+    img = image.copy()
+    if resize_to:
+        img = img.resize(resize_to, Image.Resampling.LANCZOS)
+    if enhance_contrast:
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(1.5)
+    return img
+
+def align_images(imageA, imageB, max_features=5000, good_match_percent=0.15):
+    try:
+        grayA = cv2.cvtColor(np.array(imageA), cv2.COLOR_RGB2GRAY)
+        grayB = cv2.cvtColor(np.array(imageB), cv2.COLOR_RGB2GRAY)
+        
+        orb = cv2.ORB_create(max_features)
+        keypointsA, descriptorsA = orb.detectAndCompute(grayA, None)
+        keypointsB, descriptorsB = orb.detectAndCompute(grayB, None)
+        
+        matcher = cv2.DescriptorMatcher_create(cv2.DESCRIPTOR_MATCHER_BRUTEFORCE_HAMMING)
+        matches = matcher.match(descriptorsA, descriptorsB)
+        matches.sort(key=lambda x: x.distance, reverse=False)
+        numGoodMatches = int(len(matches) * good_match_percent)
+        matches = matches[:numGoodMatches]
+        
+        points1 = np.zeros((len(matches), 2), dtype=np.float32)
+        points2 = np.zeros((len(matches), 2), dtype=np.float32)
+        
+        for i, match in enumerate(matches):
+            points1[i, :] = keypointsA[match.queryIdx].pt
+            points2[i, :] = keypointsB[match.trainIdx].pt
+            
+        h, mask = cv2.findHomography(points2, points1, cv2.RANSAC)
+        
+        height, width = grayA.shape[:2]
+        aligned = cv2.warpPerspective(np.array(imageB), h, (width, height))
+        
+        return Image.fromarray(aligned), True
+    except Exception as e:
+        return imageB, False
+
+def find_differences(imageA, imageB, threshold=0.85, min_area=150):
+    try:
+        if imageA.size != imageB.size:
+            imageB = imageB.resize(imageA.size, Image.Resampling.LANCZOS)
+        grayA = cv2.cvtColor(np.array(imageA), cv2.COLOR_RGB2GRAY)
+        grayB = cv2.cvtColor(np.array(imageB), cv2.COLOR_RGB2GRAY)
+        score, diff = ssim(grayA, grayB, full=True)
+        diff = (diff * 255).astype("uint8")
+        thresh = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+        cnts = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts = imutils.grab_contours(cnts)
+        filtered_cnts = [c for c in cnts if cv2.contourArea(c) > min_area]
+        bounding_boxes = []
+        for c in filtered_cnts:
+            x, y, w, h = cv2.boundingRect(c)
+            bounding_boxes.append((x, y, w, h))
+        return {
+            'ssim_score': score,
+            'bounding_boxes': bounding_boxes,
+            'total_differences': len(bounding_boxes)
+        }
+    except Exception as e:
+        st.error(f"Error finding differences: {e}")
+        return None
+
+def boxes_overlap(boxA, boxB, iou_threshold=0.3):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+    iou = interArea / float(boxAArea + boxBArea - interArea + 1e-6)
+    return iou > iou_threshold
+
+def draw_differences(image, bounding_boxes, color=(255, 0, 0), thickness=2, label=""):
+    img_with_boxes = image.copy()
+    draw = ImageDraw.Draw(img_with_boxes)
+    for (x, y, w, h) in bounding_boxes:
+        draw.rectangle([x, y, x + w, y + h], outline=color, width=thickness)
+        if label:
+            draw.text((x, max(0, y-15)), label, fill=color)
+    return img_with_boxes
+
+def draw_symbol_boxes(image, detections, color_map=None, thickness=2):
+    img_with_boxes = image.copy()
+    draw = ImageDraw.Draw(img_with_boxes)
+    if color_map is None:
+        color_map = {
+            "Added": (0,255,0), 
+            "Removed": (255,0,0), 
+            "Misplaced": (255,255,0), 
+            "Symbol": (0,0,255) 
+        }
+        
+    for d in detections:
+        x1, y1, x2, y2 = map(int, d["bbox"])
+        label = d.get("label", "Symbol")
+        color = color_map.get(label, (0,0,255))
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=thickness)
+        draw.text((x1, max(0, y1-15)), label, fill=color)
+    return img_with_boxes
+
+def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=85):
+    if base_df.empty or comp_df.empty:
+        return [], []
+    
+    base_vals_list = base_df[base_df['Type'] == comp_type]['Value'].tolist()
+    comp_vals_list = comp_df[comp_df['Type'] == comp_type]['Value'].tolist()
+    
+    added = []
+    deleted = []
+
+    if comp_type in ['Barcode', 'Image']:
+        base_set = set(base_vals_list)
+        comp_set = set(comp_vals_list)
+        added = list(comp_set - base_set)
+        deleted = list(base_set - comp_set)
+        return added, deleted
+
+    for b_val in base_vals_list:
+        match_found = False
+        norm_b = b_val.lower().strip() 
+        for c_val in comp_vals_list:
+            if fuzz.token_set_ratio(norm_b, c_val.lower().strip()) >= fuzzy_threshold:
+                match_found = True
+                break
+        if not match_found:
+            deleted.append(b_val)
+
+    for c_val in comp_vals_list:
+        match_found = False
+        norm_c = c_val.lower().strip() 
+        for b_val in base_vals_list:
+            if fuzz.token_set_ratio(norm_c, b_val.lower().strip()) >= fuzzy_threshold:
+                match_found = True
+                break
+        if not match_found:
+            added.append(c_val)
+
+    return added, deleted
+
+def ocr_crop(image, box):
+    x, y, w, h = box
+    pad = 5
+    img_width = image.shape[1] if isinstance(image, np.ndarray) else image.width
+    img_height = image.shape[0] if isinstance(image, np.ndarray) else image.height
+    
+    x1, y1 = max(0, x-pad), max(0, y-pad)
+    x2, y2 = min(img_width, x+w+pad), min(img_height, y+h+pad)
+    
+    crop = np.array(image)[y1:y2, x1:x2]
+    if crop.size == 0: return ""
+    
+    if len(crop.shape) == 3: gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    else: gray = crop
+        
     gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    text = pytesseract.image_to_string(gray, lang='eng+fra+deu', config='--psm 6').strip()
     
-    data = pytesseract.image_to_data(gray, output_type=Output.DICT, lang='eng+fra+deu', config='--psm 3')
-    
-    lines = {}
-    n_boxes = len(data['text'])
-    for i in range(n_boxes):
-        text = data['text'][i].strip()
-        conf = int(data['conf'][i])
-        
-        if conf > 40 and len(text) > 1:
-            block_num = data['block_num'][i]
-            line_num = data['line_num'][i]
-            key = f"{block_num}_{line_num}"
-            
-            x1 = int(data['left'][i] * 0.5)
-            y1 = int(data['top'][i] * 0.5)
-            x2 = int((data['left'][i] + data['width'][i]) * 0.5)
-            y2 = int((data['top'][i] + data['height'][i]) * 0.5)
-            
-            if key not in lines:
-                lines[key] = {"text": text, "bbox": [x1, y1, x2, y2]}
-            else:
-                lines[key]["text"] += " " + text
-                lines[key]["bbox"][0] = min(lines[key]["bbox"][0], x1)
-                lines[key]["bbox"][1] = min(lines[key]["bbox"][1], y1)
-                lines[key]["bbox"][2] = max(lines[key]["bbox"][2], x2)
-                lines[key]["bbox"][3] = max(lines[key]["bbox"][3], y2)
-                
-    result = []
-    for v in lines.values():
-        clean_text = re.sub(r'[|><_~=«»"*;]', '', v["text"]).strip()
-        if len(clean_text) > 2:
-            result.append({"text": clean_text, "bbox": v["bbox"]})
-            
-    return result
+    text = re.sub(r'[|><_~=«»"*;]', '', text).strip()
+    text = re.sub(r'\n+', ' ', text) 
+    return text
 
-# -------------------------------------------------------------------
-# 3. SEMANTIC MATCHING ENGINES WITH RELATIVE COORDINATES
-# -------------------------------------------------------------------
-def get_rel_center(bbox, img_width, img_height):
-    """Calculates the center of a box as a percentage of the total image size"""
-    cx = (bbox[0] + bbox[2]) / 2.0
-    cy = (bbox[1] + bbox[3]) / 2.0
-    return (cx / img_width, cy / img_height)
-
-def match_semantic_text(base_blocks, child_blocks, base_size, child_size):
-    bw, bh = base_size
-    cw, ch = child_size
-    
-    added, deleted, modified, misplaced = [], [], [], []
-    matched_child_indices = set()
-    
-    for b_block in base_blocks:
-        best_match = None
-        best_ratio = 0
-        best_idx = -1
-        
-        for idx, c_block in enumerate(child_blocks):
-            if idx in matched_child_indices: continue
-            
-            ratio = fuzz.token_set_ratio(b_block["text"].lower(), c_block["text"].lower())
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_match = c_block
-                best_idx = idx
-                
-        if best_ratio >= 90:
-            matched_child_indices.add(best_idx)
-            
-            # Check relative distance (5% tolerance)
-            bc = get_rel_center(b_block["bbox"], bw, bh)
-            cc = get_rel_center(best_match["bbox"], cw, ch)
-            if math.dist(bc, cc) > 0.05:
-                misplaced.append({"base": b_block, "child": best_match})
-                
-        elif 70 <= best_ratio < 90:
-            matched_child_indices.add(best_idx)
-            modified.append({"base": b_block, "child": best_match})
-        else:
-            deleted.append(b_block)
-            
-    for idx, c_block in enumerate(child_blocks):
-        if idx not in matched_child_indices:
-            added.append(c_block)
-            
-    return added, deleted, modified, misplaced
-
-def match_semantic_symbols(base_syms, child_syms, base_size, child_size):
-    bw, bh = base_size
-    cw, ch = child_size
-    
-    added, deleted, misplaced = [], [], []
-    matched_child_indices = set()
-    
-    for b_sym in base_syms:
-        best_match = None
-        min_dist = float('inf')
-        best_idx = -1
-        
-        for idx, c_sym in enumerate(child_syms):
-            if idx in matched_child_indices: continue
-            if b_sym["class"] == c_sym["class"]:
-                bc = get_rel_center(b_sym["bbox"], bw, bh)
-                cc = get_rel_center(c_sym["bbox"], cw, ch)
-                dist = math.dist(bc, cc)
-                
-                if dist < min_dist:
-                    min_dist = dist
-                    best_match = c_sym
-                    best_idx = idx
-                    
-        if best_match is not None:
-            matched_child_indices.add(best_idx)
-            # If the closest matching symbol is more than 5% off layout, it's misplaced
-            if min_dist > 0.05:
-                misplaced.append({"base": b_sym, "child": best_match})
-        else:
-            deleted.append(b_sym)
-            
-    for idx, c_sym in enumerate(child_syms):
-        if idx not in matched_child_indices:
-            added.append(c_sym)
-            
-    return added, deleted, misplaced
-
-def get_feature_diffs(base_df, comp_df, comp_type):
-    if base_df.empty or comp_df.empty: return [], []
-    base_set = set(base_df[base_df['Type'] == comp_type]['Value'].tolist())
-    comp_set = set(comp_df[comp_df['Type'] == comp_type]['Value'].tolist())
-    return list(comp_set - base_set), list(base_set - comp_set)
-
-# -------------------------------------------------------------------
-# 4. VISUALIZATION
-# -------------------------------------------------------------------
-def draw_semantic_boxes(image, boxes, color, label_key="text", label_prefix=""):
-    img_copy = image.copy()
-    draw = ImageDraw.Draw(img_copy)
-    for item in boxes:
-        x1, y1, x2, y2 = item["bbox"]
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-        display_text = f"{label_prefix} {item.get(label_key, '')}"[:25]
-        draw.text((x1, max(0, y1-15)), display_text, fill=color)
-    return img_copy
-
-# --- Main App Execution ---
+# --- Main App ---
 
 st.markdown('<h1 class="main-header">LABEL COMPARATOR PRO</h1>', unsafe_allow_html=True)
 
@@ -227,76 +247,163 @@ st.write("")
 col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
 with col_btn2:
     compare_clicked = st.button("Compare labels", use_container_width=True)
+st.write("") 
 
 if compare_clicked:
     if base_file is not None and child_files:
-        with st.status("Performing Analysis...", expanded=True) as status:
+        with st.status("Analyzing labels securely...", expanded=True) as status:
             
-            # --- BASE PROCESSING ---
             status.write("Processing base document...")
-            base_img = process_upload(base_file)
-            base_text_blocks = get_text_blocks(base_img)
-            base_symbols = run_detection_pil(base_img)
-            base_features_df = extract_all_features(base_img, base_symbols, logo_folder="logos")
+            raw_base_img = process_upload(base_file)
+            base_processed = preprocess_image(raw_base_img, enhance_contrast=False)
             
+            base_symbols_raw = run_detection_pil(base_processed)
+            base_features_df = extract_all_features(raw_base_img, base_symbols_raw, logo_folder="logos")
+            
+            base_symbols = []
+            for d in base_symbols_raw:
+                d = d.copy()
+                d["label"] = "Symbol"
+                base_symbols.append(d)
+                
             tabs = st.tabs([f.name for f in child_files])
             
             for tab, child_file in zip(tabs, child_files):
                 with tab:
-                    # --- CHILD PROCESSING ---
                     status.write(f"Analyzing {child_file.name}...")
-                    child_img = process_upload(child_file)
-                    child_text_blocks = get_text_blocks(child_img)
-                    child_symbols = run_detection_pil(child_img)
-                    comp_features_df = extract_all_features(child_img, child_symbols, logo_folder="logos")
+                    raw_child_img = process_upload(child_file)
+                    comp_processed = preprocess_image(raw_child_img, enhance_contrast=False)
                     
-                    # --- SEMANTIC COMPARISON (RELATIVE MATH) ---
-                    text_add, text_del, text_mod, text_mis = match_semantic_text(
-                        base_text_blocks, child_text_blocks, base_img.size, child_img.size)
-                        
-                    sym_add, sym_del, sym_mis = match_semantic_symbols(
-                        base_symbols, child_symbols, base_img.size, child_img.size)
-                        
-                    bc_add, bc_del = get_feature_diffs(base_features_df, comp_features_df, 'Barcode')
-                    img_add, img_del = get_feature_diffs(base_features_df, comp_features_df, 'Image')
-
-                    # --- VISUAL RENDERING ---
-                    base_render = base_img.copy()
-                    child_render = child_img.copy()
-
-                    # Draw Text Diffs
-                    base_render = draw_semantic_boxes(base_render, text_del, (255, 0, 0), "text", "DEL:")
-                    child_render = draw_semantic_boxes(child_render, text_add, (0, 255, 0), "text", "NEW:")
+                    comp_aligned, aligned_success = align_images(base_processed, comp_processed)
                     
-                    for mod in text_mod:
-                        base_render = draw_semantic_boxes(base_render, [mod["base"]], (255, 165, 0), "text", "MOD:")
-                        child_render = draw_semantic_boxes(child_render, [mod["child"]], (255, 165, 0), "text", "MOD:")
-                        
-                    for mis in text_mis:
-                        base_render = draw_semantic_boxes(base_render, [mis["base"]], (255, 255, 0), "text", "MOVED:")
-                        child_render = draw_semantic_boxes(child_render, [mis["child"]], (255, 255, 0), "text", "MOVED:")
-
-                    # Draw Symbol Diffs
-                    base_render = draw_semantic_boxes(base_render, sym_del, (255, 0, 0), "class", "DEL:")
-                    child_render = draw_semantic_boxes(child_render, sym_add, (0, 255, 0), "class", "NEW:")
+                    if not aligned_success:
+                        comp_aligned = comp_processed.resize(base_processed.size, Image.Resampling.LANCZOS)
                     
-                    for mis in sym_mis:
-                        base_render = draw_semantic_boxes(base_render, [mis["base"]], (255, 255, 0), "class", "MOVED:")
-                        child_render = draw_semantic_boxes(child_render, [mis["child"]], (255, 255, 0), "class", "MOVED:")
+                    comp_symbols_raw = run_detection_pil(comp_aligned)
+                    comp_features_df = extract_all_features(comp_aligned, comp_symbols_raw, logo_folder="logos")
+                        
+                    diff_results = find_differences(base_processed, comp_aligned, threshold=0.85, min_area=150)
+                    
+                    if not diff_results:
+                        st.error(f"Error comparing '{child_file.name}'")
+                        continue
+                        
+                    comp_symbols_final = []
+                    
+                    def region_has_symbol(image, bbox, threshold=15):
+                        x1, y1, x2, y2 = map(int, bbox)
+                        crop = np.array(image)[y1:y2, x1:x2]
+                        if crop.size == 0: return False
+                        if len(crop.shape) == 3:
+                            crop_gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+                        else:
+                            crop_gray = crop
+                        non_bg = np.sum(crop_gray < 240)
+                        return non_bg > threshold
+
+                    # -------------------------------------------------------------
+                    # FIX: ADVANCED SYMBOL DISTANCE CLAIMING ALGORITHM
+                    # -------------------------------------------------------------
+                    dynamic_threshold = base_processed.width * 0.04 
+                    claimed_child_indices = set()
+                    
+                    for base_sym in base_symbols_raw:
+                        best_match = None
+                        min_dist = float('inf')
+                        best_idx = -1
+                        
+                        # Find the *closest* unclaimed symbol of the same class
+                        for idx, c_sym in enumerate(comp_symbols_raw):
+                            if c_sym["class"] == base_sym["class"] and idx not in claimed_child_indices:
+                                c1 = get_center(base_sym["bbox"])
+                                c2 = get_center(c_sym["bbox"])
+                                dist = math.dist(c1, c2)
+                                if dist < min_dist:
+                                    min_dist = dist
+                                    best_match = c_sym
+                                    best_idx = idx
+                                    
+                        if best_match is not None:
+                            claimed_child_indices.add(best_idx)
+                            if min_dist > dynamic_threshold:
+                                if region_has_symbol(comp_aligned, best_match["bbox"]):
+                                    misplaced_box = best_match.copy()
+                                    misplaced_box["label"] = "Misplaced"
+                                    comp_symbols_final.append(misplaced_box)
+                        else:
+                            missing_box = base_sym.copy()
+                            missing_box["label"] = "Removed"
+                            comp_symbols_final.append(missing_box)
+
+                    # Any child symbols never claimed must be Newly Added
+                    for idx, c_sym in enumerate(comp_symbols_raw):
+                        if idx not in claimed_child_indices:
+                            added_box = c_sym.copy()
+                            added_box["label"] = "Added"
+                            comp_symbols_final.append(added_box)
+                            
+                    comp_symbols = comp_symbols_final
+                    
+                    # -------------------------------------------------------------
+
+                    ssim_boxes = diff_results['bounding_boxes']
+                    text_diff_boxes = []
+                    for box in ssim_boxes:
+                        overlap = False
+                        box_coords = [box[0], box[1], box[0]+box[2], box[1]+box[3]]
+                        for sym in base_symbols:
+                            if boxes_overlap(box_coords, sym["bbox"]): overlap = True; break
+                        for sym in comp_symbols:
+                            if boxes_overlap(box_coords, sym["bbox"]): overlap = True; break
+                        if not overlap:
+                            text_diff_boxes.append(box)
+
+                    actual_deleted_boxes = []
+                    actual_added_boxes = []
+                    changed_boxes = []
+
+                    base_gray = cv2.cvtColor(np.array(base_processed), cv2.COLOR_RGB2GRAY)
+                    child_gray = cv2.cvtColor(np.array(comp_aligned), cv2.COLOR_RGB2GRAY)
+
+                    for (x, y, w, h) in text_diff_boxes:
+                        crop_b = base_gray[y:y+h, x:x+w]
+                        crop_c = child_gray[y:y+h, x:x+w]
+                        
+                        if crop_b.size == 0 or crop_c.size == 0: continue
+                        
+                        dark_pixels_b = np.sum(crop_b < 220)
+                        dark_pixels_c = np.sum(crop_c < 220)
+                        
+                        min_pixels = 15 
+                        has_content_b = dark_pixels_b > min_pixels
+                        has_content_c = dark_pixels_c > min_pixels
+                        
+                        if has_content_b and not has_content_c:
+                            actual_deleted_boxes.append((x, y, w, h))
+                        elif not has_content_b and has_content_c:
+                            actual_added_boxes.append((x, y, w, h))
+                        elif has_content_b and has_content_c:
+                            changed_boxes.append((x, y, w, h))
+
+                    base_marked = draw_differences(base_processed, actual_deleted_boxes, color=(255,0,0), label="Deleted")
+                    base_marked = draw_differences(base_marked, changed_boxes, color=(255,165,0), label="Changed")
+                    
+                    comp_marked = draw_differences(comp_aligned, actual_added_boxes, color=(0,255,0), label="Added")
+                    comp_marked = draw_differences(comp_marked, changed_boxes, color=(255,165,0), label="Changed")
+                    comp_marked = draw_symbol_boxes(comp_marked, comp_symbols, color_map={"Added": (0,255,0), "Removed": (255,0,0), "Misplaced": (255,255,0)})
 
                     st.markdown("---")
                     st.markdown("### Visual Comparison")
-                    st.info("Boxes are generated based on data content and relative spacing. Yellow indicates the item is identical but shifted in the layout.")
                     img_col1, img_col2 = st.columns(2)
                     
                     with img_col1:
                         st.markdown("**Label B (Base)**")
-                        st.image(base_render, use_container_width=True)
+                        st.image(base_marked, use_container_width=True)
+                        
                     with img_col2:
                         st.markdown(f"**Label C (Child: {child_file.name})**")
-                        st.image(child_render, use_container_width=True)
+                        st.image(comp_marked, use_container_width=True)
                         
-                    # --- RESTORED FEATURE EXTRACTED TABLES ---
                     st.markdown("---")
                     st.markdown("### Feature Extracted Tables")
                     
@@ -307,41 +414,68 @@ if compare_clicked:
                     with feat_col2:
                         st.markdown("**Child Features**")
                         st.dataframe(comp_features_df, use_container_width=True, hide_index=True)
-                        
-                    # --- REPORT GENERATION ---
+
+                    added_text = []
+                    for box in actual_added_boxes:
+                        txt = ocr_crop(comp_aligned, box)
+                        if txt and len(txt) > 2: added_text.append(txt)
+
+                    deleted_text = []
+                    for box in actual_deleted_boxes:
+                        txt = ocr_crop(base_processed, box)
+                        if txt and len(txt) > 2: deleted_text.append(txt)
+
+                    modified_text = []
+                    for box in changed_boxes:
+                        txt_b = ocr_crop(base_processed, box)
+                        txt_c = ocr_crop(comp_aligned, box)
+                        if txt_b or txt_c:
+                            modified_text.append(f"From: '{txt_b}' ➔ To: '{txt_c}'")
+
+                    added_bc, deleted_bc = get_feature_diffs(base_features_df, comp_features_df, 'Barcode')
+                    added_img, deleted_img = get_feature_diffs(base_features_df, comp_features_df, 'Image')
+
+                    added_syms = [s["class"] for s in comp_symbols if s["label"] == "Added"]
+                    removed_syms = [s["class"] for s in comp_symbols if s["label"] == "Removed"]
+                    misplaced_syms = [s["class"] for s in comp_symbols if s["label"] == "Misplaced"]
+                    
                     st.markdown("---")
                     st.markdown("### 📊 Interactive Discrepancy Report")
                     
                     diff_data = []
                     
-                    for t in text_add: diff_data.append({"Category": "Text", "Status": "Added", "Value": t["text"]})
-                    for t in text_del: diff_data.append({"Category": "Text", "Status": "Deleted", "Value": t["text"]})
-                    for t in text_mod: diff_data.append({"Category": "Text", "Status": "Modified", "Value": f"From: {t['base']['text']} ➔ To: {t['child']['text']}"})
-                    for t in text_mis: diff_data.append({"Category": "Text", "Status": "Misplaced", "Value": t["base"]["text"]})
+                    for item in added_text: diff_data.append({"Category": "Text", "Status": "Added", "Value": item})
+                    for item in deleted_text: diff_data.append({"Category": "Text", "Status": "Deleted", "Value": item})
+                    for item in modified_text: diff_data.append({"Category": "Text", "Status": "Modified", "Value": item})
                     
-                    for s in sym_add: diff_data.append({"Category": "Symbol", "Status": "Added", "Value": s["class"]})
-                    for s in sym_del: diff_data.append({"Category": "Symbol", "Status": "Deleted", "Value": s["class"]})
-                    for s in sym_mis: diff_data.append({"Category": "Symbol", "Status": "Misplaced", "Value": s["base"]["class"]})
+                    for item in added_syms: diff_data.append({"Category": "Symbol", "Status": "Added", "Value": item})
+                    for item in misplaced_syms: diff_data.append({"Category": "Symbol", "Status": "Misplaced", "Value": item})
+                    for item in removed_syms: diff_data.append({"Category": "Symbol", "Status": "Deleted", "Value": item})
                     
-                    for b in bc_add: diff_data.append({"Category": "Barcode", "Status": "Added", "Value": b})
-                    for b in bc_del: diff_data.append({"Category": "Barcode", "Status": "Deleted", "Value": b})
+                    for item in added_bc: diff_data.append({"Category": "Barcode", "Status": "Added", "Value": item})
+                    for item in deleted_bc: diff_data.append({"Category": "Barcode", "Status": "Deleted", "Value": item})
                     
-                    for i in img_add: diff_data.append({"Category": "Image", "Status": "Added", "Value": i})
-                    for i in img_del: diff_data.append({"Category": "Image", "Status": "Deleted", "Value": i})
+                    for item in added_img: diff_data.append({"Category": "Image", "Status": "Added", "Value": item})
+                    for item in deleted_img: diff_data.append({"Category": "Image", "Status": "Deleted", "Value": item})
 
                     if diff_data:
                         diff_df = pd.DataFrame(diff_data)
+                        
                         def highlight_status(row):
-                            if row['Status'] == 'Added': return ['background-color: rgba(40, 167, 69, 0.2); color: #155724'] * len(row)
-                            if row['Status'] == 'Deleted': return ['background-color: rgba(220, 53, 69, 0.2); color: #721c24'] * len(row)
-                            if row['Status'] == 'Modified': return ['background-color: rgba(23, 162, 184, 0.2); color: #0c5460'] * len(row)
-                            if row['Status'] == 'Misplaced': return ['background-color: rgba(255, 193, 7, 0.2); color: #856404'] * len(row)
+                            if row['Status'] == 'Added':
+                                return ['background-color: rgba(40, 167, 69, 0.2); color: #155724'] * len(row)
+                            elif row['Status'] == 'Deleted':
+                                return ['background-color: rgba(220, 53, 69, 0.2); color: #721c24'] * len(row)
+                            elif row['Status'] == 'Misplaced':
+                                return ['background-color: rgba(255, 193, 7, 0.2); color: #856404'] * len(row)
+                            elif row['Status'] == 'Modified':
+                                return ['background-color: rgba(23, 162, 184, 0.2); color: #0c5460'] * len(row)
                             return [''] * len(row)
                         
                         styled_df = diff_df.style.apply(highlight_status, axis=1)
                         st.dataframe(styled_df, use_container_width=True, hide_index=True)
                     else:
-                        st.success("✅ No semantic discrepancies found! All required data is present and correctly placed.")
+                        st.success("✅ No discrepancies found! The labels match perfectly.")
                         
             status.update(label="Analysis Complete!", state="complete", expanded=False)
 
