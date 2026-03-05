@@ -17,8 +17,8 @@ from detect import run_detection_pil, get_center
 try:
     from Extract import extract_all_features
 except ImportError as e:
-    # Fallback if extractor isn't ready, but this fix requires it.
-    st.error(f"Error loading {e}")
+    # Fallback if extractor isn't ready or if OpenCV headless is missing
+    st.error(f"Error loading external module: {e}")
     st.stop()
 
 # Page configuration
@@ -34,10 +34,6 @@ st.markdown("""
         div.stButton > button { background-color: #f4a303 !important; color: #ffffff !important; border: none; border-radius: 5px; font-size: 16px; font-weight: bold; padding: 10px 24px; }
         div.stButton > button:hover { background-color: #e09600 !important; color: white !important; }
         [data-testid="stFileUploader"] { background-color: #ffffff; border: 1px solid #dee2e6; border-radius: 8px; padding: 10px; }
-        .results-text { color: #333333; font-size: 16px; line-height: 1.6; }
-        .results-text-title { color: #064b75; font-weight: bold; margin-top: 15px; margin-bottom: 5px; }
-        .highlight-green { color: green; font-weight: bold; }
-        .highlight-red { color: red; font-weight: bold; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -110,10 +106,6 @@ def align_images(imageA, imageB, max_features=500, good_match_percent=0.15):
         return imageA, False
 
 def find_differences(imageA, imageB, threshold=0.85, min_area=150):
-    """
-    Finds differences, slightly relaxing sensitivity to reduce phantom boxes.
-    Updated default threshold (0.8 -> 0.85) and min_area (100 -> 150).
-    """
     try:
         if imageA.size != imageB.size:
             imageB = imageB.resize(imageA.size, Image.Resampling.LANCZOS)
@@ -178,10 +170,10 @@ def draw_symbol_boxes(image, detections, color_map=None, thickness=2):
     draw = ImageDraw.Draw(img_with_boxes)
     if color_map is None:
         color_map = {
-            "Added": (0,255,0), # Green
-            "Removed": (255,0,0), # Red
-            "Misplaced": (255,255,0), # Yellow
-            "Symbol": (0,0,255) # Blue
+            "Added": (0,255,0), 
+            "Removed": (255,0,0), 
+            "Misplaced": (255,255,0), 
+            "Symbol": (0,0,255) 
         }
         
     for d in detections:
@@ -194,21 +186,15 @@ def draw_symbol_boxes(image, detections, color_map=None, thickness=2):
 
 # --- Helper for Diffing Features with NEW FUZZY LOGIC ---
 def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=95):
-    """
-    Master function to compare component values. Utilizes Fuzzy Matching 
-    for 'Text' type to handle OCR noise/jitter, solving 'Added AND Deleted' issues.
-    """
     if base_df.empty or comp_df.empty:
         return [], []
     
-    # Get raw lists for Text, sets for exact matching (BC/Image)
     base_vals_list = base_df[base_df['Type'] == comp_type]['Value'].tolist()
     comp_vals_list = comp_df[comp_df['Type'] == comp_type]['Value'].tolist()
     
     added = []
     deleted = []
 
-    # 1. Handle Barcodes and Images exactly (No OCR noise here)
     if comp_type in ['Barcode', 'Image']:
         base_set = set(base_vals_list)
         comp_set = set(comp_vals_list)
@@ -216,25 +202,20 @@ def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=95):
         deleted = list(base_set - comp_set)
         return added, deleted
 
-    # 2. Handle Text with Deep Level Fuzzy Matching
-    # Find Deleted (Items in Base NOT sufficiently matched in Child)
     for b_val in base_vals_list:
         match_found = False
-        norm_b = b_val.lower().strip() # Base normalization
+        norm_b = b_val.lower().strip() 
         for c_val in comp_vals_list:
-            # Check for high similarity score (95%+ match)
             if fuzz.ratio(norm_b, c_val.lower().strip()) >= fuzzy_threshold:
                 match_found = True
                 break
         if not match_found:
             deleted.append(b_val)
 
-    # Find Added (Items in Child NOT sufficiently matched in Base)
     for c_val in comp_vals_list:
         match_found = False
-        norm_c = c_val.lower().strip() # Child normalization
+        norm_c = c_val.lower().strip() 
         for b_val in base_vals_list:
-            # Check for high similarity score
             if fuzz.ratio(norm_c, b_val.lower().strip()) >= fuzzy_threshold:
                 match_found = True
                 break
@@ -261,16 +242,13 @@ st.write("")
 
 if compare_clicked:
     if base_file is not None and child_files:
-        # Use st.status for better progress feedback
         with st.status("Analyzing labels at deep level...", expanded=True) as status:
             
-            # 1. Process Base
             status.write("Processing base document and extracting features...")
             raw_base_img = process_upload(base_file)
             base_processed = preprocess_image(raw_base_img, enhance_contrast=False)
             base_symbols_raw = run_detection_pil(base_processed)
             
-            # Run the new master extraction (extractor.py)
             base_features_df = extract_all_features(raw_base_img, logo_folder="logos")
             
             base_symbols = []
@@ -279,7 +257,6 @@ if compare_clicked:
                 d["label"] = "Symbol"
                 base_symbols.append(d)
                 
-            # Process each Child
             tabs = st.tabs([f.name for f in child_files])
             
             for tab, child_file in zip(tabs, child_files):
@@ -288,22 +265,18 @@ if compare_clicked:
                     raw_child_img = process_upload(child_file)
                     comp_processed = preprocess_image(raw_child_img, enhance_contrast=False)
                     
-                    # Run the new master extraction on child
                     comp_features_df = extract_all_features(raw_child_img, logo_folder="logos")
                     
-                    # Align child to base
                     comp_aligned, aligned_success = align_images(base_processed, comp_processed)
                     if not aligned_success:
                         comp_aligned = comp_processed
                         
-                    # SSIM Differences (using slightly relaxed visual threshold)
                     diff_results = find_differences(base_processed, comp_aligned, threshold=0.85, min_area=150)
                     
                     if not diff_results:
                         st.error(f"Error comparing '{child_file.name}'")
                         continue
                         
-                    # ML Symbol Comparison
                     comp_symbols_raw = run_detection_pil(comp_aligned)
                     comp_symbols_final = []
                     
@@ -343,10 +316,7 @@ if compare_clicked:
                             
                     comp_symbols = comp_symbols_final
                     
-                    # --- NEW INTELLIGENT DIFFERENCE CATEGORIZATION ---
                     ssim_boxes = diff_results['bounding_boxes']
-                    
-                    # 1. Filter out areas that YOLO already identified as symbols
                     text_diff_boxes = []
                     for box in ssim_boxes:
                         overlap = False
@@ -358,7 +328,6 @@ if compare_clicked:
                         if not overlap:
                             text_diff_boxes.append(box)
 
-                    # 2. Categorize the remaining text boxes by checking pixel density
                     actual_deleted_boxes = []
                     actual_added_boxes = []
                     changed_boxes = []
@@ -367,18 +336,15 @@ if compare_clicked:
                     child_gray = cv2.cvtColor(np.array(comp_aligned), cv2.COLOR_RGB2GRAY)
 
                     for (x, y, w, h) in text_diff_boxes:
-                        # Crop region from both images
                         crop_b = base_gray[y:y+h, x:x+w]
                         crop_c = child_gray[y:y+h, x:x+w]
                         
                         if crop_b.size == 0 or crop_c.size == 0: continue
                         
-                        # Count dark pixels (assuming dark text on light background)
-                        # Threshold 220: Anything darker than light gray is considered "content"
                         dark_pixels_b = np.sum(crop_b < 220)
                         dark_pixels_c = np.sum(crop_c < 220)
                         
-                        min_pixels = 15 # Ignore tiny specks of dust/noise
+                        min_pixels = 15 
                         has_content_b = dark_pixels_b > min_pixels
                         has_content_c = dark_pixels_c > min_pixels
                         
@@ -387,22 +353,16 @@ if compare_clicked:
                         elif not has_content_b and has_content_c:
                             actual_added_boxes.append((x, y, w, h))
                         elif has_content_b and has_content_c:
-                            # Content exists in both, meaning the text changed/shifted
                             changed_boxes.append((x, y, w, h))
 
-                    # 3. Draw Discrepancies Intelligently
-                    # Base Image gets Deleted (Red) and Changed (Orange)
                     base_marked = draw_differences(base_processed, actual_deleted_boxes, color=(255,0,0), label="Deleted")
                     base_marked = draw_differences(base_marked, changed_boxes, color=(255,165,0), label="Changed")
                     
-                    # Child Image gets Added (Green) and Changed (Orange)
                     comp_marked = draw_differences(comp_aligned, actual_added_boxes, color=(0,255,0), label="Added")
                     comp_marked = draw_differences(comp_marked, changed_boxes, color=(255,165,0), label="Changed")
-                    
-                    # Finally, draw the ML Symbol boxes over the top
                     comp_marked = draw_symbol_boxes(comp_marked, comp_symbols, color_map={"Added": (0,255,0), "Removed": (255,0,0), "Misplaced": (255,255,0)})
 
-                    # --- Display UI ---
+                    st.markdown("---")
                     st.markdown("### Visual Comparison")
                     img_col1, img_col2 = st.columns(2)
                     
@@ -414,7 +374,6 @@ if compare_clicked:
                         st.markdown(f"**Label C (Child: {child_file.name})**")
                         st.image(comp_marked, use_container_width=True)
                         
-                    # Extracted Features
                     st.markdown("---")
                     st.markdown("### Feature Extracted Tables")
                     
@@ -425,9 +384,6 @@ if compare_clicked:
                     with feat_col2:
                         st.markdown("**Child Features**")
                         st.dataframe(comp_features_df, use_container_width=True, hide_index=True)
-                        
-                    # Calculate Differences for Output utilizing the NEW get_feature_diffs
-                    # Parameter sets fuzzy matching threshold (95%+ match)
 
                     added_text, deleted_text = get_feature_diffs(base_features_df, comp_features_df, 'Text', fuzzy_threshold=95)
                     added_bc, deleted_bc = get_feature_diffs(base_features_df, comp_features_df, 'Barcode')
@@ -437,15 +393,9 @@ if compare_clicked:
                     removed_syms = [s["class"] for s in comp_symbols if s["label"] == "Removed"]
                     misplaced_syms = [s["class"] for s in comp_symbols if s["label"] == "Misplaced"]
                     
-                    # Comparison Text
-                    st.markdown("---")
-                    st.markdown("### Discrepancy Report (Non-Tabular)")
-                    
-                    # --- NEW VISUAL DISCREPANCY REPORT ---
                     st.markdown("---")
                     st.markdown("### 📊 Interactive Discrepancy Report")
                     
-                    # 1. Compile all differences into a structured list
                     diff_data = []
                     
                     for item in added_text: diff_data.append({"Category": "Text", "Status": "Added", "Value": item})
@@ -461,7 +411,6 @@ if compare_clicked:
                     for item in added_img: diff_data.append({"Category": "Image", "Status": "Added", "Value": item})
                     for item in deleted_img: diff_data.append({"Category": "Image", "Status": "Deleted", "Value": item})
 
-                    # 2. Convert to DataFrame and apply beautiful color styling
                     if diff_data:
                         diff_df = pd.DataFrame(diff_data)
                         
@@ -475,11 +424,10 @@ if compare_clicked:
                             return [''] * len(row)
                         
                         styled_df = diff_df.style.apply(highlight_status, axis=1)
-                        
-                        # Display as an interactive dataframe
                         st.dataframe(styled_df, use_container_width=True, hide_index=True)
                     else:
                         st.success("✅ No discrepancies found! The labels match perfectly.")
+                        
             status.update(label="Deep Analysis Complete!", state="complete", expanded=False)
 
     else:
