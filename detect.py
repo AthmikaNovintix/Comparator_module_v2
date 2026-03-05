@@ -1,20 +1,25 @@
+import streamlit as st
 from ultralytics import YOLO
 import cv2
 import math
 import tempfile
 
 # -----------------------------
-# Load Models
+# Lazy Load Models (Prevents RAM crashes)
 # -----------------------------
-# Models are loaded once when this module is imported.
-model16 = YOLO("16sym_models/best.pt")
-model4 = YOLO("4sym_models/best.pt")
-
+@st.cache_resource
+def load_yolo_models():
+    """Loads YOLO models only when needed and keeps them in memory"""
+    m16 = YOLO("16sym_models/best.pt")
+    m4 = YOLO("4sym_models/best.pt")
+    return m16, m4
 
 # -----------------------------
 # Run Detection (For File Paths)
 # -----------------------------
 def run_detection(image_path):
+    model16, model4 = load_yolo_models() # Get the cached models
+    
     results16 = model16(image_path, conf=0.3)[0]
     results4 = model4(image_path, conf=0.3)[0]
 
@@ -32,12 +37,13 @@ def run_detection(image_path):
 
     return detections
 
-
 # -----------------------------
 # Run Detection (For Streamlit/PIL)
 # -----------------------------
 def run_detection_pil(pil_image):
     """Handles PIL images coming from Streamlit"""
+    model16, model4 = load_yolo_models() # Get the cached models
+    
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         pil_image.save(tmp.name)
         results16 = model16(tmp.name, conf=0.3)[0]
@@ -55,7 +61,6 @@ def run_detection_pil(pil_image):
         detections.append({"class": cls, "bbox": bbox, "label": "Symbol"})
         
     return detections
-
 
 # -----------------------------
 # Utility / Math Logic
@@ -97,26 +102,22 @@ def compare_labels(base_det, edited_det, threshold=40):
                     
     return added, removed, misplaced
 
-
 # -----------------------------
 # CLI Output Visualization
 # -----------------------------
 def draw_results(image_path, added, removed, misplaced):
     img = cv2.imread(image_path)
 
-    # Green → Added
     for d in added:
         x1, y1, x2, y2 = map(int, d["bbox"])
         cv2.rectangle(img, (x1, y1), (x2, y2), (0,255,0), 2)
         cv2.putText(img, "Added", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
 
-    # Red → Removed
     for d in removed:
         x1, y1, x2, y2 = map(int, d["bbox"])
         cv2.rectangle(img, (x1, y1), (x2, y2), (0,0,255), 2)
         cv2.putText(img, "Removed", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
 
-    # Yellow → Misplaced
     for d in misplaced:
         x1, y1, x2, y2 = map(int, d["bbox"])
         cv2.rectangle(img, (x1, y1), (x2, y2), (0,255,255), 2)
@@ -124,24 +125,3 @@ def draw_results(image_path, added, removed, misplaced):
 
     cv2.imwrite("comparison_output.jpg", img)
     print("✅ Output saved as comparison_output.jpg")
-
-
-# -----------------------------
-# MAIN (For local CLI testing)
-# -----------------------------
-if __name__ == "__main__":
-    base_image = "LCN_IMG_Base.jpg"
-    edited_image = "LCN-IMG_CHILD_sym_removed.jpg"
-
-    print("🔍 Running detection...")
-    base_det = run_detection(base_image)
-    edited_det = run_detection(edited_image)
-
-    print("📊 Comparing labels...")
-    added, removed, misplaced = compare_labels(base_det, edited_det)
-
-    print(f"Added: {len(added)}")
-    print(f"Removed: {len(removed)}")
-    print(f"Misplaced: {len(misplaced)}")
-
-    draw_results(edited_image, added, removed, misplaced)
