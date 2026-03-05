@@ -76,29 +76,41 @@ def preprocess_image(image, resize_to=None, enhance_contrast=False):
         img = enhancer.enhance(1.5)
     return img
 
-def align_images(imageA, imageB, max_features=500, good_match_percent=0.15):
+def align_images(imageA, imageB, max_features=5000, good_match_percent=0.15):
+    """Aligns imageB (Child) perfectly to imageA (Base), handling any size differences"""
     try:
         grayA = cv2.cvtColor(np.array(imageA), cv2.COLOR_RGB2GRAY)
         grayB = cv2.cvtColor(np.array(imageB), cv2.COLOR_RGB2GRAY)
+        
+        # Increased max_features from 500 to 5000 to handle complex, differently-sized labels
         orb = cv2.ORB_create(max_features)
         keypointsA, descriptorsA = orb.detectAndCompute(grayA, None)
         keypointsB, descriptorsB = orb.detectAndCompute(grayB, None)
+        
         matcher = cv2.DescriptorMatcher_create(cv2.DESCRIPTOR_MATCHER_BRUTEFORCE_HAMMING)
         matches = matcher.match(descriptorsA, descriptorsB)
         matches.sort(key=lambda x: x.distance, reverse=False)
         numGoodMatches = int(len(matches) * good_match_percent)
         matches = matches[:numGoodMatches]
+        
         points1 = np.zeros((len(matches), 2), dtype=np.float32)
         points2 = np.zeros((len(matches), 2), dtype=np.float32)
+        
         for i, match in enumerate(matches):
             points1[i, :] = keypointsA[match.queryIdx].pt
             points2[i, :] = keypointsB[match.trainIdx].pt
-        h, mask = cv2.findHomography(points1, points2, cv2.RANSAC)
-        height, width = grayB.shape[:2]
-        aligned = cv2.warpPerspective(np.array(imageA), h, (width, height))
+            
+        # CRITICAL FIX: Map points2 (Child) to points1 (Base)
+        h, mask = cv2.findHomography(points2, points1, cv2.RANSAC)
+        
+        # Warp imageB (Child) to match exactly the width/height dimensions of imageA (Base)
+        height, width = grayA.shape[:2]
+        aligned = cv2.warpPerspective(np.array(imageB), h, (width, height))
+        
         return Image.fromarray(aligned), True
     except Exception as e:
-        return imageA, False
+        # If alignment totally fails, safely return the un-aligned Child image
+        return imageB, False
 
 def find_differences(imageA, imageB, threshold=0.85, min_area=150):
     try:
