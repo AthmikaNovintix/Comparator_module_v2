@@ -233,6 +233,32 @@ def ocr_crop(image, box):
     text = re.sub(r'\n+', ' ', text) 
     return text
 
+def agentic_smart_resize(img, target_size):
+    """
+    Agentic Decision: Calculates aspect ratio. 
+    If they don't match, it pads the image with white space instead of squishing it.
+    """
+    target_w, target_h = target_size
+    img_w, img_h = img.size
+    
+    # Determine the scaling factor that won't distort the image
+    ratio = min(target_w / img_w, target_h / img_h)
+    new_w = int(img_w * ratio)
+    new_h = int(img_h * ratio)
+    
+    # Resize while maintaining perfect aspect ratio
+    resized_img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    
+    # Create a blank white canvas of the exact target size
+    canvas = Image.new("RGB", target_size, (255, 255, 255))
+    
+    # Paste the resized image directly into the center of the canvas
+    paste_x = (target_w - new_w) // 2
+    paste_y = (target_h - new_h) // 2
+    canvas.paste(resized_img, (paste_x, paste_y))
+    
+    return canvas
+
 # --- Main App ---
 
 st.markdown('<h1 class="main-header">LABEL COMPARATOR PRO</h1>', unsafe_allow_html=True)
@@ -276,8 +302,9 @@ if compare_clicked:
                     
                     comp_aligned, aligned_success = align_images(base_processed, comp_processed)
                     
+                    # THE AGENTIC FIX: Never squish the image. Use smart letterboxing if alignment fails.
                     if not aligned_success:
-                        comp_aligned = comp_processed.resize(base_processed.size, Image.Resampling.LANCZOS)
+                        comp_aligned = agentic_smart_resize(comp_processed, base_processed.size)
                     
                     comp_symbols_raw = run_detection_pil(comp_aligned)
                     comp_features_df = extract_all_features(comp_aligned, comp_symbols_raw, logo_folder="logos")
