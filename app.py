@@ -49,7 +49,7 @@ def pdf_to_image(uploaded_file, dpi=200):
     pdf_document.close()
     return image
 
-def process_upload(uploaded_file, max_width=1000):
+def process_upload(uploaded_file, target_width=1000):
     if uploaded_file is None:
         return None
     if uploaded_file.name.lower().endswith(".pdf"):
@@ -59,10 +59,11 @@ def process_upload(uploaded_file, max_width=1000):
         if img.mode != 'RGB':
             img = img.convert('RGB')
             
-    if img.width > max_width:
-        ratio = max_width / float(img.width)
-        new_height = int((float(img.height) * float(ratio)))
-        img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+    # STRICT STANDARDIZATION: Force every image to exactly 1000px wide
+    # This prevents all cross-scale coordinate mismatch bugs
+    ratio = target_width / float(img.width)
+    new_height = int((float(img.height) * float(ratio)))
+    img = img.resize((target_width, new_height), Image.Resampling.LANCZOS)
         
     return img
 
@@ -77,7 +78,6 @@ def preprocess_image(image, resize_to=None, enhance_contrast=False):
     return img
 
 def align_images(imageA, imageB, max_features=5000, good_match_percent=0.15):
-    """Aligns imageB (Child) perfectly to imageA (Base), handling any size differences"""
     try:
         grayA = cv2.cvtColor(np.array(imageA), cv2.COLOR_RGB2GRAY)
         grayB = cv2.cvtColor(np.array(imageB), cv2.COLOR_RGB2GRAY)
@@ -99,7 +99,6 @@ def align_images(imageA, imageB, max_features=5000, good_match_percent=0.15):
             points1[i, :] = keypointsA[match.queryIdx].pt
             points2[i, :] = keypointsB[match.trainIdx].pt
             
-        # Map Child (points2) onto Base (points1)
         h, mask = cv2.findHomography(points2, points1, cv2.RANSAC)
         
         height, width = grayA.shape[:2]
@@ -111,7 +110,6 @@ def align_images(imageA, imageB, max_features=5000, good_match_percent=0.15):
 
 def find_differences(imageA, imageB, threshold=0.85, min_area=150):
     try:
-        # Final safety net: ensure exact dimensions
         if imageA.size != imageB.size:
             imageB = imageB.resize(imageA.size, Image.Resampling.LANCZOS)
         grayA = cv2.cvtColor(np.array(imageA), cv2.COLOR_RGB2GRAY)
@@ -278,7 +276,6 @@ if compare_clicked:
                     
                     comp_aligned, aligned_success = align_images(base_processed, comp_processed)
                     
-                    # THE CRITICAL FIX: Force exact dimension matching if alignment fails
                     if not aligned_success:
                         comp_aligned = comp_processed.resize(base_processed.size, Image.Resampling.LANCZOS)
                     
@@ -304,37 +301,51 @@ if compare_clicked:
                         non_bg = np.sum(crop_gray < 240)
                         return non_bg > threshold
 
-                    # SCALE INVARIANT DYNAMIC THRESHOLD
+                    # -------------------------------------------------------------
+                    # FIX: ADVANCED SYMBOL DISTANCE CLAIMING ALGORITHM
+                    # -------------------------------------------------------------
                     dynamic_threshold = base_processed.width * 0.04 
-
-                    # 1. Check for Misplaced and Removed Symbols
+                    claimed_child_indices = set()
+                    
                     for base_sym in base_symbols_raw:
-                        matches = [c for c in comp_symbols_raw if c["class"] == base_sym["class"]]
-                        if matches:
-                            for match in matches:
+                        best_match = None
+                        min_dist = float('inf')
+                        best_idx = -1
+                        
+                        # Find the *closest* unclaimed symbol of the same class
+                        for idx, c_sym in enumerate(comp_symbols_raw):
+                            if c_sym["class"] == base_sym["class"] and idx not in claimed_child_indices:
                                 c1 = get_center(base_sym["bbox"])
-                                c2 = get_center(match["bbox"])
+                                c2 = get_center(c_sym["bbox"])
                                 dist = math.dist(c1, c2)
-                                
-                                if dist > dynamic_threshold: 
-                                    if region_has_symbol(comp_aligned, match["bbox"]):
-                                        misplaced_box = match.copy()
-                                        misplaced_box["label"] = "Misplaced"
-                                        comp_symbols_final.append(misplaced_box)
+                                if dist < min_dist:
+                                    min_dist = dist
+                                    best_match = c_sym
+                                    best_idx = idx
+                                    
+                        if best_match is not None:
+                            claimed_child_indices.add(best_idx)
+                            if min_dist > dynamic_threshold:
+                                if region_has_symbol(comp_aligned, best_match["bbox"]):
+                                    misplaced_box = best_match.copy()
+                                    misplaced_box["label"] = "Misplaced"
+                                    comp_symbols_final.append(misplaced_box)
                         else:
                             missing_box = base_sym.copy()
                             missing_box["label"] = "Removed"
                             comp_symbols_final.append(missing_box)
-                            
-                    # 2. Check for newly Added symbols
-                    for d in comp_symbols_raw:
-                        if d["class"] not in [b["class"] for b in base_symbols_raw]:
-                            added_box = d.copy()
+
+                    # Any child symbols never claimed must be Newly Added
+                    for idx, c_sym in enumerate(comp_symbols_raw):
+                        if idx not in claimed_child_indices:
+                            added_box = c_sym.copy()
                             added_box["label"] = "Added"
                             comp_symbols_final.append(added_box)
                             
                     comp_symbols = comp_symbols_final
                     
+                    # -------------------------------------------------------------
+
                     ssim_boxes = diff_results['bounding_boxes']
                     text_diff_boxes = []
                     for box in ssim_boxes:
