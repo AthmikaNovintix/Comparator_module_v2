@@ -1,6 +1,3 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-torchvision
 streamlit
 pandas
 numpy<2.0.0
@@ -10,7 +7,7 @@ opencv-contrib-python-headless
 scikit-image
 imutils
 ultralytics
-easyocr
 zxing-cpp
 rapidfuzz
 XlsxWriter
+pytesseract
