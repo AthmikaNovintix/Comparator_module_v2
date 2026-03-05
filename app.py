@@ -441,29 +441,45 @@ if compare_clicked:
                     st.markdown("---")
                     st.markdown("### Discrepancy Report (Non-Tabular)")
                     
-                    res_md = f"""
-                    **Text component:**
-                    * **Added:** {", ".join(added_text) if added_text else "None"}
-                    * **Misplaced:** N/A (Visual tracking via green boxes above)
-                    * **Deleted:** {", ".join(deleted_text) if deleted_text else "None"}
+                    # --- NEW VISUAL DISCREPANCY REPORT ---
+                    st.markdown("---")
+                    st.markdown("### 📊 Interactive Discrepancy Report")
                     
-                    **Symbol component:**
-                    * **Added:** {", ".join(added_syms) if added_syms else "None"}
-                    * **Misplaced:** {", ".join(misplaced_syms) if misplaced_syms else "None"}
-                    * **Deleted:** {", ".join(removed_syms) if removed_syms else "None"}
+                    # 1. Compile all differences into a structured list
+                    diff_data = []
                     
-                    **Barcode component:**
-                    * **Added:** {", ".join(added_bc) if added_bc else "None"}
-                    * **Misplaced:** None
-                    * **Deleted:** {", ".join(deleted_bc) if deleted_bc else "None"}
+                    for item in added_text: diff_data.append({"Category": "Text", "Status": "Added", "Value": item})
+                    for item in deleted_text: diff_data.append({"Category": "Text", "Status": "Deleted", "Value": item})
                     
-                    **Image component:**
-                    * **Added:** {", ".join(added_img) if added_img else "None"}
-                    * **Misplaced:** None
-                    * **Deleted:** {", ".join(deleted_img) if deleted_img else "None"}
-                    """
+                    for item in added_syms: diff_data.append({"Category": "Symbol", "Status": "Added", "Value": item})
+                    for item in misplaced_syms: diff_data.append({"Category": "Symbol", "Status": "Misplaced", "Value": item})
+                    for item in removed_syms: diff_data.append({"Category": "Symbol", "Status": "Deleted", "Value": item})
                     
-                    st.markdown(res_md)
+                    for item in added_bc: diff_data.append({"Category": "Barcode", "Status": "Added", "Value": item})
+                    for item in deleted_bc: diff_data.append({"Category": "Barcode", "Status": "Deleted", "Value": item})
+                    
+                    for item in added_img: diff_data.append({"Category": "Image", "Status": "Added", "Value": item})
+                    for item in deleted_img: diff_data.append({"Category": "Image", "Status": "Deleted", "Value": item})
+
+                    # 2. Convert to DataFrame and apply beautiful color styling
+                    if diff_data:
+                        diff_df = pd.DataFrame(diff_data)
+                        
+                        def highlight_status(row):
+                            if row['Status'] == 'Added':
+                                return ['background-color: rgba(40, 167, 69, 0.2); color: #155724'] * len(row)
+                            elif row['Status'] == 'Deleted':
+                                return ['background-color: rgba(220, 53, 69, 0.2); color: #721c24'] * len(row)
+                            elif row['Status'] == 'Misplaced':
+                                return ['background-color: rgba(255, 193, 7, 0.2); color: #856404'] * len(row)
+                            return [''] * len(row)
+                        
+                        styled_df = diff_df.style.apply(highlight_status, axis=1)
+                        
+                        # Display as an interactive dataframe
+                        st.dataframe(styled_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.success("✅ No discrepancies found! The labels match perfectly.")
             status.update(label="Deep Analysis Complete!", state="complete", expanded=False)
 
     else:
