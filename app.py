@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from PIL import Image, ImageDraw, ImageEnhance
+from PIL import Image, ImageDraw
 import fitz  # PyMuPDF
 import io
 import cv2
@@ -8,6 +8,7 @@ import numpy as np
 import pytesseract
 from pytesseract import Output
 import re
+import math
 
 from rapidfuzz import fuzz
 from detect import run_detection_pil
@@ -77,13 +78,11 @@ def get_text_blocks(_image):
         text = data['text'][i].strip()
         conf = int(data['conf'][i])
         
-        # Only accept highly confident text to eliminate noise
         if conf > 40 and len(text) > 1:
             block_num = data['block_num'][i]
             line_num = data['line_num'][i]
             key = f"{block_num}_{line_num}"
             
-            # Scale coordinates back down to original image size
             x1 = int(data['left'][i] * 0.5)
             y1 = int(data['top'][i] * 0.5)
             x2 = int((data['left'][i] + data['width'][i]) * 0.5)
@@ -93,7 +92,6 @@ def get_text_blocks(_image):
                 lines[key] = {"text": text, "bbox": [x1, y1, x2, y2]}
             else:
                 lines[key]["text"] += " " + text
-                # Expand bounding box to fit the entire line
                 lines[key]["bbox"][0] = min(lines[key]["bbox"][0], x1)
                 lines[key]["bbox"][1] = min(lines[key]["bbox"][1], y1)
                 lines[key]["bbox"][2] = max(lines[key]["bbox"][2], x2)
@@ -108,10 +106,19 @@ def get_text_blocks(_image):
     return result
 
 # -------------------------------------------------------------------
-# 3. SEMANTIC MATCHING ENGINES
+# 3. SEMANTIC MATCHING ENGINES WITH RELATIVE COORDINATES
 # -------------------------------------------------------------------
-def match_semantic_text(base_blocks, child_blocks):
-    added, deleted, modified = [], [], []
+def get_rel_center(bbox, img_width, img_height):
+    """Calculates the center of a box as a percentage of the total image size"""
+    cx = (bbox[0] + bbox[2]) / 2.0
+    cy = (bbox[1] + bbox[3]) / 2.0
+    return (cx / img_width, cy / img_height)
+
+def match_semantic_text(base_blocks, child_blocks, base_size, child_size):
+    bw, bh = base_size
+    cw, ch = child_size
+    
+    added, deleted, modified, misplaced = [], [], [], []
     matched_child_indices = set()
     
     for b_block in base_blocks:
@@ -129,40 +136,63 @@ def match_semantic_text(base_blocks, child_blocks):
                 best_idx = idx
                 
         if best_ratio >= 90:
-            matched_child_indices.add(best_idx) # Perfect match
+            matched_child_indices.add(best_idx)
+            
+            # Check relative distance (5% tolerance)
+            bc = get_rel_center(b_block["bbox"], bw, bh)
+            cc = get_rel_center(best_match["bbox"], cw, ch)
+            if math.dist(bc, cc) > 0.05:
+                misplaced.append({"base": b_block, "child": best_match})
+                
         elif 70 <= best_ratio < 90:
-            matched_child_indices.add(best_idx) # Modified
+            matched_child_indices.add(best_idx)
             modified.append({"base": b_block, "child": best_match})
         else:
-            deleted.append(b_block) # Deleted
+            deleted.append(b_block)
             
     for idx, c_block in enumerate(child_blocks):
         if idx not in matched_child_indices:
             added.append(c_block)
             
-    return added, deleted, modified
+    return added, deleted, modified, misplaced
 
-def match_semantic_symbols(base_syms, child_syms):
-    """Matches symbols strictly by class count, ignoring coordinates completely"""
-    added, deleted = [], []
+def match_semantic_symbols(base_syms, child_syms, base_size, child_size):
+    bw, bh = base_size
+    cw, ch = child_size
+    
+    added, deleted, misplaced = [], [], []
     matched_child_indices = set()
     
     for b_sym in base_syms:
-        matched = False
+        best_match = None
+        min_dist = float('inf')
+        best_idx = -1
+        
         for idx, c_sym in enumerate(child_syms):
             if idx in matched_child_indices: continue
             if b_sym["class"] == c_sym["class"]:
-                matched_child_indices.add(idx)
-                matched = True
-                break
-        if not matched:
+                bc = get_rel_center(b_sym["bbox"], bw, bh)
+                cc = get_rel_center(c_sym["bbox"], cw, ch)
+                dist = math.dist(bc, cc)
+                
+                if dist < min_dist:
+                    min_dist = dist
+                    best_match = c_sym
+                    best_idx = idx
+                    
+        if best_match is not None:
+            matched_child_indices.add(best_idx)
+            # If the closest matching symbol is more than 5% off layout, it's misplaced
+            if min_dist > 0.05:
+                misplaced.append({"base": b_sym, "child": best_match})
+        else:
             deleted.append(b_sym)
             
     for idx, c_sym in enumerate(child_syms):
         if idx not in matched_child_indices:
             added.append(c_sym)
             
-    return added, deleted
+    return added, deleted, misplaced
 
 def get_feature_diffs(base_df, comp_df, comp_type):
     if base_df.empty or comp_df.empty: return [], []
@@ -179,14 +209,13 @@ def draw_semantic_boxes(image, boxes, color, label_key="text", label_prefix=""):
     for item in boxes:
         x1, y1, x2, y2 = item["bbox"]
         draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-        
         display_text = f"{label_prefix} {item.get(label_key, '')}"[:25]
         draw.text((x1, max(0, y1-15)), display_text, fill=color)
     return img_copy
 
 # --- Main App Execution ---
 
-st.markdown('<h1 class="main-header">LAYOUT AGNOSTIC COMPARATOR</h1>', unsafe_allow_html=True)
+st.markdown('<h1 class="main-header">LABEL COMPARATOR PRO</h1>', unsafe_allow_html=True)
 
 col_upload1, col_upload2 = st.columns(2)
 with col_upload1:
@@ -201,10 +230,10 @@ with col_btn2:
 
 if compare_clicked:
     if base_file is not None and child_files:
-        with st.status("Performing Semantic Layout-Agnostic Analysis...", expanded=True) as status:
+        with st.status("Performing Analysis...", expanded=True) as status:
             
             # --- BASE PROCESSING ---
-            status.write("Mapping Base Layout...")
+            status.write("Processing base document...")
             base_img = process_upload(base_file)
             base_text_blocks = get_text_blocks(base_img)
             base_symbols = run_detection_pil(base_img)
@@ -215,18 +244,21 @@ if compare_clicked:
             for tab, child_file in zip(tabs, child_files):
                 with tab:
                     # --- CHILD PROCESSING ---
-                    status.write(f"Mapping Child Layout for {child_file.name}...")
+                    status.write(f"Analyzing {child_file.name}...")
                     child_img = process_upload(child_file)
                     child_text_blocks = get_text_blocks(child_img)
                     child_symbols = run_detection_pil(child_img)
-                    child_features_df = extract_all_features(child_img, child_symbols, logo_folder="logos")
+                    comp_features_df = extract_all_features(child_img, child_symbols, logo_folder="logos")
                     
-                    # --- SEMANTIC COMPARISON (NO PIXEL MATH) ---
-                    status.write("Correlating Semantic Maps...")
-                    text_add, text_del, text_mod = match_semantic_text(base_text_blocks, child_text_blocks)
-                    sym_add, sym_del = match_semantic_symbols(base_symbols, child_symbols)
-                    bc_add, bc_del = get_feature_diffs(base_features_df, child_features_df, 'Barcode')
-                    img_add, img_del = get_feature_diffs(base_features_df, child_features_df, 'Image')
+                    # --- SEMANTIC COMPARISON (RELATIVE MATH) ---
+                    text_add, text_del, text_mod, text_mis = match_semantic_text(
+                        base_text_blocks, child_text_blocks, base_img.size, child_img.size)
+                        
+                    sym_add, sym_del, sym_mis = match_semantic_symbols(
+                        base_symbols, child_symbols, base_img.size, child_img.size)
+                        
+                    bc_add, bc_del = get_feature_diffs(base_features_df, comp_features_df, 'Barcode')
+                    img_add, img_del = get_feature_diffs(base_features_df, comp_features_df, 'Image')
 
                     # --- VISUAL RENDERING ---
                     base_render = base_img.copy()
@@ -239,14 +271,22 @@ if compare_clicked:
                     for mod in text_mod:
                         base_render = draw_semantic_boxes(base_render, [mod["base"]], (255, 165, 0), "text", "MOD:")
                         child_render = draw_semantic_boxes(child_render, [mod["child"]], (255, 165, 0), "text", "MOD:")
+                        
+                    for mis in text_mis:
+                        base_render = draw_semantic_boxes(base_render, [mis["base"]], (255, 255, 0), "text", "MOVED:")
+                        child_render = draw_semantic_boxes(child_render, [mis["child"]], (255, 255, 0), "text", "MOVED:")
 
                     # Draw Symbol Diffs
                     base_render = draw_semantic_boxes(base_render, sym_del, (255, 0, 0), "class", "DEL:")
                     child_render = draw_semantic_boxes(child_render, sym_add, (0, 255, 0), "class", "NEW:")
+                    
+                    for mis in sym_mis:
+                        base_render = draw_semantic_boxes(base_render, [mis["base"]], (255, 255, 0), "class", "MOVED:")
+                        child_render = draw_semantic_boxes(child_render, [mis["child"]], (255, 255, 0), "class", "MOVED:")
 
                     st.markdown("---")
-                    st.markdown("### Visual Comparison (Layout Agnostic)")
-                    st.info("Boxes are generated based on data content, not pixel placement. The app is immune to layout shifts.")
+                    st.markdown("### Visual Comparison")
+                    st.info("Boxes are generated based on data content and relative spacing. Yellow indicates the item is identical but shifted in the layout.")
                     img_col1, img_col2 = st.columns(2)
                     
                     with img_col1:
@@ -256,18 +296,32 @@ if compare_clicked:
                         st.markdown(f"**Label C (Child: {child_file.name})**")
                         st.image(child_render, use_container_width=True)
                         
+                    # --- RESTORED FEATURE EXTRACTED TABLES ---
+                    st.markdown("---")
+                    st.markdown("### Feature Extracted Tables")
+                    
+                    feat_col1, feat_col2 = st.columns(2)
+                    with feat_col1:
+                        st.markdown("**Base Features**")
+                        st.dataframe(base_features_df, use_container_width=True, hide_index=True)
+                    with feat_col2:
+                        st.markdown("**Child Features**")
+                        st.dataframe(comp_features_df, use_container_width=True, hide_index=True)
+                        
                     # --- REPORT GENERATION ---
                     st.markdown("---")
-                    st.markdown("### 📊 Absolute Discrepancy Report")
+                    st.markdown("### 📊 Interactive Discrepancy Report")
                     
                     diff_data = []
                     
                     for t in text_add: diff_data.append({"Category": "Text", "Status": "Added", "Value": t["text"]})
                     for t in text_del: diff_data.append({"Category": "Text", "Status": "Deleted", "Value": t["text"]})
                     for t in text_mod: diff_data.append({"Category": "Text", "Status": "Modified", "Value": f"From: {t['base']['text']} ➔ To: {t['child']['text']}"})
+                    for t in text_mis: diff_data.append({"Category": "Text", "Status": "Misplaced", "Value": t["base"]["text"]})
                     
                     for s in sym_add: diff_data.append({"Category": "Symbol", "Status": "Added", "Value": s["class"]})
                     for s in sym_del: diff_data.append({"Category": "Symbol", "Status": "Deleted", "Value": s["class"]})
+                    for s in sym_mis: diff_data.append({"Category": "Symbol", "Status": "Misplaced", "Value": s["base"]["class"]})
                     
                     for b in bc_add: diff_data.append({"Category": "Barcode", "Status": "Added", "Value": b})
                     for b in bc_del: diff_data.append({"Category": "Barcode", "Status": "Deleted", "Value": b})
@@ -280,15 +334,16 @@ if compare_clicked:
                         def highlight_status(row):
                             if row['Status'] == 'Added': return ['background-color: rgba(40, 167, 69, 0.2); color: #155724'] * len(row)
                             if row['Status'] == 'Deleted': return ['background-color: rgba(220, 53, 69, 0.2); color: #721c24'] * len(row)
-                            if row['Status'] == 'Modified': return ['background-color: rgba(255, 193, 7, 0.2); color: #856404'] * len(row)
+                            if row['Status'] == 'Modified': return ['background-color: rgba(23, 162, 184, 0.2); color: #0c5460'] * len(row)
+                            if row['Status'] == 'Misplaced': return ['background-color: rgba(255, 193, 7, 0.2); color: #856404'] * len(row)
                             return [''] * len(row)
                         
                         styled_df = diff_df.style.apply(highlight_status, axis=1)
                         st.dataframe(styled_df, use_container_width=True, hide_index=True)
                     else:
-                        st.success("✅ No semantic discrepancies found! All required data is present.")
+                        st.success("✅ No semantic discrepancies found! All required data is present and correctly placed.")
                         
-            status.update(label="Semantic Analysis Complete!", state="complete", expanded=False)
+            status.update(label="Analysis Complete!", state="complete", expanded=False)
 
     else:
         st.error("Please ensure both the Base Label and at least one Child Label are uploaded.")
