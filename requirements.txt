@@ -1,6 +1,9 @@
-﻿streamlit
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+streamlit
 pandas
-numpy
+numpy<2.0.0
 Pillow
 PyMuPDF
 opencv-contrib-python-headless
@@ -10,5 +13,4 @@ ultralytics
 easyocr
 zxing-cpp
 rapidfuzz
-
 XlsxWriter
