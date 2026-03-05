@@ -1,19 +1,10 @@
-import streamlit as st
 import pandas as pd
 import numpy as np
 import cv2
 import os
-import easyocr
 import zxingcpp
+import pytesseract
 from PIL import Image
-import gc  # NEW: Python Garbage Collector
-
-# --- Prevent PyTorch from using too much RAM ---
-import torch
-torch.set_num_threads(1) 
-
-# Import your existing YOLO logic
-from detect import run_detection_pil
 
 def extract_barcodes(image):
     """Decodes barcodes using ZXing to get perfect GTINs"""
@@ -54,7 +45,6 @@ def detect_logos(image, logo_folder="logos"):
             index_params = dict(algorithm=1, trees=5)
             search_params = dict(checks=50)
             flann = cv2.FlannBasedMatcher(index_params, search_params)
-            
             matches = flann.knnMatch(des2, des1, k=2)
             
             good_matches = []
@@ -74,8 +64,8 @@ def detect_logos(image, logo_folder="logos"):
             
     return detected_logos
 
-def extract_all_features(image, logo_folder="logos"):
-    """Master function to extract Text, Symbols, Barcodes, and Logos"""
+def extract_all_features(image, precomputed_symbols, logo_folder="logos"):
+    """Master function to extract Text, Barcodes, Logos, and append Symbols"""
     features = []
 
     # 1. Barcode Extraction
@@ -88,30 +78,27 @@ def extract_all_features(image, logo_folder="logos"):
     for logo in logos:
         features.append({"Type": "Image", "Value": f"Image - {logo}"})
 
-    # 3. Symbol Extraction (YOLO loads, runs, and deletes itself inside here)
-    symbols = run_detection_pil(image)
-    for sym in symbols:
+    # 3. Append Symbols (Passed from app.py to save massive amounts of RAM!)
+    for sym in precomputed_symbols:
         features.append({"Type": "Symbol", "Value": sym["class"]})
 
-    # 4. Text Extraction (Load and Dump OCR)
-    reader = easyocr.Reader(['en', 'fr', 'de'], gpu=False)
-    
+    # 4. Ultra-lightweight Text Extraction (Tesseract)
     np_img = np.array(image)
-    ocr_results = reader.readtext(
-        np_img, 
-        detail=0,          
-        mag_ratio=1.5,     
-        contrast_ths=0.1,  
-        text_threshold=0.6 
-    )
+    if len(np_img.shape) == 3 and np_img.shape[2] == 3:
+        gray = cv2.cvtColor(np_img, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = np_img
+        
+    # Scale image up slightly to catch tiny German/French text
+    gray = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
     
-    for text in ocr_results:
-        clean_text = text.strip()
-        if clean_text and clean_text not in barcodes:
+    # Run OCR for English, French, and German using practically zero RAM
+    ocr_text = pytesseract.image_to_string(gray, lang='eng+fra+deu')
+    
+    for line in ocr_text.split('\n'):
+        clean_text = line.strip()
+        # Ignore empty lines, tiny noise specks, or duplicate barcodes
+        if len(clean_text) > 2 and clean_text not in barcodes:
             features.append({"Type": "Text", "Value": clean_text})
-
-    # CRITICAL: Delete OCR and force RAM cleanup
-    del reader
-    gc.collect()
 
     return pd.DataFrame(features)
