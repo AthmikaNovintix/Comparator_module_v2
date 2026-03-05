@@ -1,3 +1,4 @@
+import re
 import pandas as pd
 import numpy as np
 import cv2
@@ -89,16 +90,18 @@ def extract_all_features(image, precomputed_symbols, logo_folder="logos"):
     else:
         gray = np_img
         
-    # Scale image up slightly to catch tiny German/French text
+    # Scale image up slightly to catch tiny text
     gray = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
     
-    # Run OCR for English, French, and German using practically zero RAM
+    # Run OCR
     ocr_text = pytesseract.image_to_string(gray, lang='eng+fra+deu')
     
     for line in ocr_text.split('\n'):
-        clean_text = line.strip()
-        # Ignore empty lines, tiny noise specks, or duplicate barcodes
-        if len(clean_text) > 2 and clean_text not in barcodes:
+        # NEW: Scrub out common OCR noise/borders (pipes, brackets, quotes)
+        clean_text = re.sub(r'[|><_~=«»"]', '', line).strip()
+        
+        # NEW: Only keep lines that have at least 3 characters AND actual letters/numbers
+        if len(clean_text) > 2 and any(c.isalnum() for c in clean_text) and clean_text not in barcodes:
             features.append({"Type": "Text", "Value": clean_text})
 
     return pd.DataFrame(features)
