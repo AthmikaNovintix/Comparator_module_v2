@@ -1,3 +1,4 @@
+import streamlit as st
 import pandas as pd
 import numpy as np
 import cv2
@@ -6,15 +7,23 @@ import easyocr
 import zxingcpp
 from PIL import Image
 
+# --- ADD THESE TWO LINES TO PREVENT CLOUD CRASHES ---
+import torch
+torch.set_num_threads(1) 
+
 # Import your existing YOLO logic
 from detect import run_detection_pil
 
-# Initialize OCR once
-reader = easyocr.Reader(['en', 'fr', 'de'], gpu=False)
+# -----------------------------
+# Lazy Load OCR (Prevents RAM crashes)
+# -----------------------------
+@st.cache_resource
+def get_ocr_reader():
+    """Loads EasyOCR only when needed and keeps it in memory"""
+    return easyocr.Reader(['en', 'fr', 'de'], gpu=False)
 
 def extract_barcodes(image):
     """Decodes barcodes using ZXing to get perfect GTINs (Avoids Windows DLL issues)"""
-    # zxingcpp works perfectly with numpy arrays
     img_np = np.array(image)
     if len(img_np.shape) == 3 and img_np.shape[2] == 3:
         # Convert RGB to BGR for standard OpenCV/ZXing processing
@@ -40,7 +49,7 @@ def detect_logos(image, logo_folder="logos"):
     valid_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
     
     for logo_file in os.listdir(logo_folder):
-        # 1. Skip non-image files (like Thumbs.db or .DS_Store) to prevent YOLO crash
+        # 1. Skip non-image files (like Thumbs.db or .DS_Store)
         if not logo_file.lower().endswith(valid_extensions):
             continue
             
@@ -64,16 +73,17 @@ def detect_logos(image, logo_folder="logos"):
             
             matches = flann.knnMatch(des2, des1, k=2)
             
-            # Lowe's ratio test to find good matches safely
+            # STRICTER Lowe's ratio test to find good matches safely (0.6 instead of 0.7)
             good_matches = []
             for match_group in matches:
                 if len(match_group) == 2:
                     m, n = match_group
-                    if m.distance < 0.7 * n.distance:
+                    if m.distance < 0.6 * n.distance:
                         good_matches.append(m)
             
-            # If we find enough matching features, the logo is present
-            if len(good_matches) > 15: 
+            # STRICTER Threshold: Require 30 matches AND 10% of logo features to stop hallucinations
+            MIN_MATCH_COUNT = 30
+            if len(good_matches) > MIN_MATCH_COUNT and len(good_matches) > (0.10 * len(kp2)): 
                 detected_logos.append(logo_file.rsplit('.', 1)[0])
                 
         except Exception as e:
@@ -82,6 +92,7 @@ def detect_logos(image, logo_folder="logos"):
             continue
             
     return detected_logos
+
 def extract_all_features(image, logo_folder="logos"):
     """Master function to extract Text, Symbols, Barcodes, and Logos"""
     features = []
@@ -101,7 +112,8 @@ def extract_all_features(image, logo_folder="logos"):
     for sym in symbols:
         features.append({"Type": "Symbol", "Value": sym["class"]})
 
-    # 4. Text Extraction (OCR with tuned parameters for small text)
+    # 4. Text Extraction 
+    reader = get_ocr_reader() # <--- CALL THE LAZY LOADED OCR HERE
     np_img = np.array(image)
     ocr_results = reader.readtext(
         np_img, 
