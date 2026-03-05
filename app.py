@@ -82,7 +82,6 @@ def align_images(imageA, imageB, max_features=5000, good_match_percent=0.15):
         grayA = cv2.cvtColor(np.array(imageA), cv2.COLOR_RGB2GRAY)
         grayB = cv2.cvtColor(np.array(imageB), cv2.COLOR_RGB2GRAY)
         
-        # Increased max_features from 500 to 5000 to handle complex, differently-sized labels
         orb = cv2.ORB_create(max_features)
         keypointsA, descriptorsA = orb.detectAndCompute(grayA, None)
         keypointsB, descriptorsB = orb.detectAndCompute(grayB, None)
@@ -100,20 +99,19 @@ def align_images(imageA, imageB, max_features=5000, good_match_percent=0.15):
             points1[i, :] = keypointsA[match.queryIdx].pt
             points2[i, :] = keypointsB[match.trainIdx].pt
             
-        # CRITICAL FIX: Map points2 (Child) to points1 (Base)
+        # Map Child (points2) onto Base (points1)
         h, mask = cv2.findHomography(points2, points1, cv2.RANSAC)
         
-        # Warp imageB (Child) to match exactly the width/height dimensions of imageA (Base)
         height, width = grayA.shape[:2]
         aligned = cv2.warpPerspective(np.array(imageB), h, (width, height))
         
         return Image.fromarray(aligned), True
     except Exception as e:
-        # If alignment totally fails, safely return the un-aligned Child image
         return imageB, False
 
 def find_differences(imageA, imageB, threshold=0.85, min_area=150):
     try:
+        # Final safety net: ensure exact dimensions
         if imageA.size != imageB.size:
             imageB = imageB.resize(imageA.size, Image.Resampling.LANCZOS)
         grayA = cv2.cvtColor(np.array(imageA), cv2.COLOR_RGB2GRAY)
@@ -147,20 +145,6 @@ def boxes_overlap(boxA, boxB, iou_threshold=0.3):
     boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
     iou = interArea / float(boxAArea + boxBArea - interArea + 1e-6)
     return iou > iou_threshold
-
-def filter_text_boxes(text_boxes, symbol_boxes):
-    filtered = []
-    for (x, y, w, h) in text_boxes:
-        text_box = [x, y, x + w, y + h]
-        overlap = False
-        for sym in symbol_boxes:
-            sym_box = sym["bbox"]
-            if boxes_overlap(text_box, sym_box):
-                overlap = True
-                break
-        if not overlap:
-            filtered.append((x, y, w, h))
-    return filtered
 
 def draw_differences(image, bounding_boxes, color=(255, 0, 0), thickness=2, label=""):
     img_with_boxes = image.copy()
@@ -207,7 +191,6 @@ def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=85):
         deleted = list(base_set - comp_set)
         return added, deleted
 
-    # Smarter token-based matching to ignore OCR noise
     for b_val in base_vals_list:
         match_found = False
         norm_b = b_val.lower().strip() 
@@ -231,10 +214,8 @@ def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=85):
     return added, deleted
 
 def ocr_crop(image, box):
-    """Extracts text ONLY from the exact physical area that changed"""
     x, y, w, h = box
     pad = 5
-    
     img_width = image.shape[1] if isinstance(image, np.ndarray) else image.width
     img_height = image.shape[0] if isinstance(image, np.ndarray) else image.height
     
@@ -278,7 +259,6 @@ if compare_clicked:
             raw_base_img = process_upload(base_file)
             base_processed = preprocess_image(raw_base_img, enhance_contrast=False)
             
-            # Run YOLO once and pass it down
             base_symbols_raw = run_detection_pil(base_processed)
             base_features_df = extract_all_features(raw_base_img, base_symbols_raw, logo_folder="logos")
             
@@ -297,10 +277,11 @@ if compare_clicked:
                     comp_processed = preprocess_image(raw_child_img, enhance_contrast=False)
                     
                     comp_aligned, aligned_success = align_images(base_processed, comp_processed)
-                    if not aligned_success:
-                        comp_aligned = comp_processed
                     
-                    # Run YOLO on child once and pass it down
+                    # THE CRITICAL FIX: Force exact dimension matching if alignment fails
+                    if not aligned_success:
+                        comp_aligned = comp_processed.resize(base_processed.size, Image.Resampling.LANCZOS)
+                    
                     comp_symbols_raw = run_detection_pil(comp_aligned)
                     comp_features_df = extract_all_features(comp_aligned, comp_symbols_raw, logo_folder="logos")
                         
@@ -323,11 +304,10 @@ if compare_clicked:
                         non_bg = np.sum(crop_gray < 240)
                         return non_bg > threshold
 
-                    # Dynamic threshold: 4% of the image's total width
-                    # This makes the app immune to different resolutions/sizes!
+                    # SCALE INVARIANT DYNAMIC THRESHOLD
                     dynamic_threshold = base_processed.width * 0.04 
 
-                    # 1. Check for Misplaced and Removed
+                    # 1. Check for Misplaced and Removed Symbols
                     for base_sym in base_symbols_raw:
                         matches = [c for c in comp_symbols_raw if c["class"] == base_sym["class"]]
                         if matches:
@@ -353,7 +333,6 @@ if compare_clicked:
                             added_box["label"] = "Added"
                             comp_symbols_final.append(added_box)
                             
-                    # Save final results
                     comp_symbols = comp_symbols_final
                     
                     ssim_boxes = diff_results['bounding_boxes']
@@ -425,9 +404,6 @@ if compare_clicked:
                         st.markdown("**Child Features**")
                         st.dataframe(comp_features_df, use_container_width=True, hide_index=True)
 
-                    # ---------------------------------------------------------
-                    # THE GOLDEN FIX: VISUALLY-DRIVEN TEXT DISCREPANCIES
-                    # ---------------------------------------------------------
                     added_text = []
                     for box in actual_added_boxes:
                         txt = ocr_crop(comp_aligned, box)
@@ -445,7 +421,6 @@ if compare_clicked:
                         if txt_b or txt_c:
                             modified_text.append(f"From: '{txt_b}' ➔ To: '{txt_c}'")
 
-                    # Get Exact matches for Barcodes and Images (Fuzzy matching disabled for these)
                     added_bc, deleted_bc = get_feature_diffs(base_features_df, comp_features_df, 'Barcode')
                     added_img, deleted_img = get_feature_diffs(base_features_df, comp_features_df, 'Image')
 
