@@ -49,7 +49,7 @@ def pdf_to_image(uploaded_file, dpi=200):
     pdf_document.close()
     return image
 
-def process_upload(uploaded_file, target_width=1000):
+def process_upload(uploaded_file, max_width=1000):
     if uploaded_file is None:
         return None
     if uploaded_file.name.lower().endswith(".pdf"):
@@ -59,11 +59,10 @@ def process_upload(uploaded_file, target_width=1000):
         if img.mode != 'RGB':
             img = img.convert('RGB')
             
-    # STRICT STANDARDIZATION: Force every image to exactly 1000px wide
-    # This prevents all cross-scale coordinate mismatch bugs
-    ratio = target_width / float(img.width)
-    new_height = int((float(img.height) * float(ratio)))
-    img = img.resize((target_width, new_height), Image.Resampling.LANCZOS)
+    if img.width > max_width:
+        ratio = max_width / float(img.width)
+        new_height = int((float(img.height) * float(ratio)))
+        img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
         
     return img
 
@@ -77,36 +76,29 @@ def preprocess_image(image, resize_to=None, enhance_contrast=False):
         img = enhancer.enhance(1.5)
     return img
 
-def align_images(imageA, imageB, max_features=5000, good_match_percent=0.15):
+def align_images(imageA, imageB, max_features=500, good_match_percent=0.15):
     try:
         grayA = cv2.cvtColor(np.array(imageA), cv2.COLOR_RGB2GRAY)
         grayB = cv2.cvtColor(np.array(imageB), cv2.COLOR_RGB2GRAY)
-        
         orb = cv2.ORB_create(max_features)
         keypointsA, descriptorsA = orb.detectAndCompute(grayA, None)
         keypointsB, descriptorsB = orb.detectAndCompute(grayB, None)
-        
         matcher = cv2.DescriptorMatcher_create(cv2.DESCRIPTOR_MATCHER_BRUTEFORCE_HAMMING)
         matches = matcher.match(descriptorsA, descriptorsB)
         matches.sort(key=lambda x: x.distance, reverse=False)
         numGoodMatches = int(len(matches) * good_match_percent)
         matches = matches[:numGoodMatches]
-        
         points1 = np.zeros((len(matches), 2), dtype=np.float32)
         points2 = np.zeros((len(matches), 2), dtype=np.float32)
-        
         for i, match in enumerate(matches):
             points1[i, :] = keypointsA[match.queryIdx].pt
             points2[i, :] = keypointsB[match.trainIdx].pt
-            
-        h, mask = cv2.findHomography(points2, points1, cv2.RANSAC)
-        
-        height, width = grayA.shape[:2]
-        aligned = cv2.warpPerspective(np.array(imageB), h, (width, height))
-        
+        h, mask = cv2.findHomography(points1, points2, cv2.RANSAC)
+        height, width = grayB.shape[:2]
+        aligned = cv2.warpPerspective(np.array(imageA), h, (width, height))
         return Image.fromarray(aligned), True
     except Exception as e:
-        return imageB, False
+        return imageA, False
 
 def find_differences(imageA, imageB, threshold=0.85, min_area=150):
     try:
@@ -143,6 +135,20 @@ def boxes_overlap(boxA, boxB, iou_threshold=0.3):
     boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
     iou = interArea / float(boxAArea + boxBArea - interArea + 1e-6)
     return iou > iou_threshold
+
+def filter_text_boxes(text_boxes, symbol_boxes):
+    filtered = []
+    for (x, y, w, h) in text_boxes:
+        text_box = [x, y, x + w, y + h]
+        overlap = False
+        for sym in symbol_boxes:
+            sym_box = sym["bbox"]
+            if boxes_overlap(text_box, sym_box):
+                overlap = True
+                break
+        if not overlap:
+            filtered.append((x, y, w, h))
+    return filtered
 
 def draw_differences(image, bounding_boxes, color=(255, 0, 0), thickness=2, label=""):
     img_with_boxes = image.copy()
@@ -189,6 +195,7 @@ def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=85):
         deleted = list(base_set - comp_set)
         return added, deleted
 
+    # Smarter token-based matching to ignore OCR noise
     for b_val in base_vals_list:
         match_found = False
         norm_b = b_val.lower().strip() 
@@ -212,8 +219,10 @@ def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=85):
     return added, deleted
 
 def ocr_crop(image, box):
+    """Extracts text ONLY from the exact physical area that changed"""
     x, y, w, h = box
     pad = 5
+    
     img_width = image.shape[1] if isinstance(image, np.ndarray) else image.width
     img_height = image.shape[0] if isinstance(image, np.ndarray) else image.height
     
@@ -257,6 +266,7 @@ if compare_clicked:
             raw_base_img = process_upload(base_file)
             base_processed = preprocess_image(raw_base_img, enhance_contrast=False)
             
+            # Run YOLO once and pass it down
             base_symbols_raw = run_detection_pil(base_processed)
             base_features_df = extract_all_features(raw_base_img, base_symbols_raw, logo_folder="logos")
             
@@ -275,10 +285,10 @@ if compare_clicked:
                     comp_processed = preprocess_image(raw_child_img, enhance_contrast=False)
                     
                     comp_aligned, aligned_success = align_images(base_processed, comp_processed)
-                    
                     if not aligned_success:
-                        comp_aligned = comp_processed.resize(base_processed.size, Image.Resampling.LANCZOS)
+                        comp_aligned = comp_processed
                     
+                    # Run YOLO on child once and pass it down
                     comp_symbols_raw = run_detection_pil(comp_aligned)
                     comp_features_df = extract_all_features(comp_aligned, comp_symbols_raw, logo_folder="logos")
                         
@@ -301,51 +311,31 @@ if compare_clicked:
                         non_bg = np.sum(crop_gray < 240)
                         return non_bg > threshold
 
-                    # -------------------------------------------------------------
-                    # FIX: ADVANCED SYMBOL DISTANCE CLAIMING ALGORITHM
-                    # -------------------------------------------------------------
-                    dynamic_threshold = base_processed.width * 0.04 
-                    claimed_child_indices = set()
-                    
                     for base_sym in base_symbols_raw:
-                        best_match = None
-                        min_dist = float('inf')
-                        best_idx = -1
-                        
-                        # Find the *closest* unclaimed symbol of the same class
-                        for idx, c_sym in enumerate(comp_symbols_raw):
-                            if c_sym["class"] == base_sym["class"] and idx not in claimed_child_indices:
+                        matches = [c for c in comp_symbols_raw if c["class"] == base_sym["class"]]
+                        if matches:
+                            for match in matches:
                                 c1 = get_center(base_sym["bbox"])
-                                c2 = get_center(c_sym["bbox"])
+                                c2 = get_center(match["bbox"])
                                 dist = math.dist(c1, c2)
-                                if dist < min_dist:
-                                    min_dist = dist
-                                    best_match = c_sym
-                                    best_idx = idx
-                                    
-                        if best_match is not None:
-                            claimed_child_indices.add(best_idx)
-                            if min_dist > dynamic_threshold:
-                                if region_has_symbol(comp_aligned, best_match["bbox"]):
-                                    misplaced_box = best_match.copy()
-                                    misplaced_box["label"] = "Misplaced"
-                                    comp_symbols_final.append(misplaced_box)
+                                if dist > 40: 
+                                    if region_has_symbol(comp_aligned, match["bbox"]):
+                                        misplaced_box = match.copy()
+                                        misplaced_box["label"] = "Misplaced"
+                                        comp_symbols_final.append(misplaced_box)
                         else:
                             missing_box = base_sym.copy()
                             missing_box["label"] = "Removed"
                             comp_symbols_final.append(missing_box)
-
-                    # Any child symbols never claimed must be Newly Added
-                    for idx, c_sym in enumerate(comp_symbols_raw):
-                        if idx not in claimed_child_indices:
-                            added_box = c_sym.copy()
+                            
+                    for d in comp_symbols_raw:
+                        if d["class"] not in [b["class"] for b in base_symbols_raw]:
+                            added_box = d.copy()
                             added_box["label"] = "Added"
                             comp_symbols_final.append(added_box)
                             
                     comp_symbols = comp_symbols_final
                     
-                    # -------------------------------------------------------------
-
                     ssim_boxes = diff_results['bounding_boxes']
                     text_diff_boxes = []
                     for box in ssim_boxes:
@@ -415,6 +405,9 @@ if compare_clicked:
                         st.markdown("**Child Features**")
                         st.dataframe(comp_features_df, use_container_width=True, hide_index=True)
 
+                    # ---------------------------------------------------------
+                    # THE GOLDEN FIX: VISUALLY-DRIVEN TEXT DISCREPANCIES
+                    # ---------------------------------------------------------
                     added_text = []
                     for box in actual_added_boxes:
                         txt = ocr_crop(comp_aligned, box)
@@ -432,6 +425,7 @@ if compare_clicked:
                         if txt_b or txt_c:
                             modified_text.append(f"From: '{txt_b}' ➔ To: '{txt_c}'")
 
+                    # Get Exact matches for Barcodes and Images (Fuzzy matching disabled for these)
                     added_bc, deleted_bc = get_feature_diffs(base_features_df, comp_features_df, 'Barcode')
                     added_img, deleted_img = get_feature_diffs(base_features_df, comp_features_df, 'Image')
 
