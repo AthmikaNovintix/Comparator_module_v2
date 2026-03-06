@@ -37,8 +37,10 @@ st.markdown("""
 # ---------------------------------------------------------
 # TEMPLATE MATCHING SYMBOL DETECTOR
 # ---------------------------------------------------------
-def detect_symbols_template(image, symbol_folder="symbols", threshold=0.75):
-    """Detects symbols dynamically across a wide range of sizes and angles"""
+# ---------------------------------------------------------
+# TEMPLATE MATCHING SYMBOL DETECTOR (STABLE VERSION)
+# ---------------------------------------------------------
+def detect_symbols_template(image, symbol_folder="symbols", threshold=0.80):
     if not os.path.exists(symbol_folder):
         return []
         
@@ -50,6 +52,7 @@ def detect_symbols_template(image, symbol_folder="symbols", threshold=0.75):
     else:
         img_gray = img_np
         
+    # Enhance base image
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     img_enhanced = clahe.apply(img_gray)
     
@@ -66,61 +69,55 @@ def detect_symbols_template(image, symbol_folder="symbols", threshold=0.75):
         
         symbol_name = os.path.splitext(symbol_file)[0]
         
-        # Extended scales to guarantee detection regardless of resolution
-        for scale in [0.1, 0.2, 0.3, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5]:
-            width = int(symbol_img.shape[1] * scale)
-            height = int(symbol_img.shape[0] * scale)
+        # CRITICAL FIX: Enhance the template image so it matches the label's contrast!
+        symbol_enhanced = clahe.apply(symbol_img)
+        
+        # Restricted to a few sensible scales to prevent hallucination explosions
+        for scale in [0.8, 0.9, 1.0, 1.1, 1.2]:
+            width = int(symbol_enhanced.shape[1] * scale)
+            height = int(symbol_enhanced.shape[0] * scale)
+            
+            # CRITICAL FIX: Prevent OpenCV crashes if template is larger than image
             if width < 10 or height < 10 or width > img_enhanced.shape[1] or height > img_enhanced.shape[0]:
                 continue
                 
-            resized_sym = cv2.resize(symbol_img, (width, height), interpolation=cv2.INTER_AREA)
+            resized_sym = cv2.resize(symbol_enhanced, (width, height), interpolation=cv2.INTER_AREA)
             
-            for angle in [0, 90, 180, 270]:
-                if angle == 0:
-                    rotated_sym = resized_sym
-                else:
-                    center = (width // 2, height // 2)
-                    M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                    cos = np.abs(M[0, 0])
-                    sin = np.abs(M[0, 1])
-                    nW = int((height * sin) + (width * cos))
-                    nH = int((height * cos) + (width * sin))
-                    M[0, 2] += (nW / 2) - center[0]
-                    M[1, 2] += (nH / 2) - center[1]
-                    rotated_sym = cv2.warpAffine(resized_sym, M, (nW, nH), borderMode=cv2.BORDER_CONSTANT, borderValue=255)
-                    
-                res = cv2.matchTemplate(img_enhanced, rotated_sym, cv2.TM_CCOEFF_NORMED)
-                loc = np.where(res >= threshold)
+            # Strict Template Matching
+            res = cv2.matchTemplate(img_enhanced, resized_sym, cv2.TM_CCOEFF_NORMED)
+            loc = np.where(res >= threshold)
+            
+            for pt in zip(*loc[::-1]):
+                x1, y1 = pt[0], pt[1]
+                x2, y2 = x1 + width, y1 + height
+                conf = float(res[y1, x1])
                 
-                for pt in zip(*loc[::-1]):
-                    x1, y1 = pt[0], pt[1]
-                    x2, y2 = x1 + rotated_sym.shape[1], y1 + rotated_sym.shape[0]
-                    conf = float(res[y1, x1])
-                    
-                    overlap = False
-                    for d in detections:
-                        if d['class'] == symbol_name:
-                            dx1, dy1, dx2, dy2 = d['bbox']
-                            ixA = max(x1, dx1); iyA = max(y1, dy1)
-                            ixB = min(x2, dx2); iyB = min(y2, dy2)
-                            interArea = max(0, ixB - ixA) * max(0, iyB - iyA)
-                            if interArea > 0:
-                                box1Area = (x2 - x1) * (y2 - y1)
-                                box2Area = (dx2 - dx1) * (dy2 - dy1)
-                                iou = interArea / float(box1Area + box2Area - interArea)
-                                if iou > 0.3:
-                                    overlap = True
-                                    if conf > d['confidence']:
-                                        d['bbox'] = [x1, y1, x2, y2]
-                                        d['confidence'] = conf
-                                    break
-                    if not overlap:
-                        detections.append({
-                            "class": symbol_name,
-                            "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                            "confidence": conf,
-                            "label": "Symbol"
-                        })
+                # Strict Non-Maximum Suppression (Prevents duplicate boxes on the same symbol)
+                overlap = False
+                for d in detections:
+                    if d['class'] == symbol_name:
+                        dx1, dy1, dx2, dy2 = d['bbox']
+                        ixA = max(x1, dx1); iyA = max(y1, dy1)
+                        ixB = min(x2, dx2); iyB = min(y2, dy2)
+                        interArea = max(0, ixB - ixA) * max(0, iyB - iyA)
+                        if interArea > 0:
+                            box1Area = (x2 - x1) * (y2 - y1)
+                            box2Area = (dx2 - dx1) * (dy2 - dy1)
+                            iou = interArea / float(box1Area + box2Area - interArea)
+                            # If boxes overlap by more than 10%, only keep the highest confidence one
+                            if iou > 0.1: 
+                                overlap = True
+                                if conf > d['confidence']:
+                                    d['bbox'] = [x1, y1, x2, y2]
+                                    d['confidence'] = conf
+                                break
+                if not overlap:
+                    detections.append({
+                        "class": symbol_name,
+                        "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                        "confidence": conf,
+                        "label": "Symbol"
+                    })
                         
     return detections
 
