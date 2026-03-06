@@ -100,7 +100,7 @@ def extract_barcodes(image):
 # EXISTING LOGO, TEXT, AND MASTER EXTRACTION LOGIC
 # ---------------------------------------------------------
 def detect_logos(image, logo_folder="logos"):
-    """Compares the label against a folder of known logos safely"""
+    """Compares the label against a folder of known logos using SIFT + RANSAC Geometry Verification"""
     if not os.path.exists(logo_folder):
         return []
 
@@ -136,18 +136,33 @@ def detect_logos(image, logo_folder="logos"):
             for match_group in matches:
                 if len(match_group) == 2:
                     m, n = match_group
-                    if m.distance < 0.6 * n.distance:
+                    # Relaxed distance threshold for text-heavy logos
+                    if m.distance < 0.75 * n.distance:
                         good_matches.append(m)
             
-            MIN_MATCH_COUNT = 30
-            if len(good_matches) > MIN_MATCH_COUNT and len(good_matches) > (0.10 * len(kp2)): 
-                detected_logos.append(logo_file.rsplit('.', 1)[0])
+            # ---------------------------------------------------------
+            # THE FIX: RANSAC GEOMETRY VERIFICATION
+            # ---------------------------------------------------------
+            # Threshold lowered to 10 to catch small/text logos safely
+            if len(good_matches) >= 10: 
+                src_pts = np.float32([ kp2[m.queryIdx].pt for m in good_matches ]).reshape(-1,1,2)
+                dst_pts = np.float32([ kp1[m.trainIdx].pt for m in good_matches ]).reshape(-1,1,2)
                 
+                # RANSAC ensures the matching points actually form the physical shape of the logo
+                M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                
+                if mask is not None:
+                    inliers = np.sum(mask)
+                    # If points form a valid geometric shape, it's a confirmed logo
+                    if inliers >= 10 and inliers >= (0.05 * len(kp2)):
+                        detected_logos.append(logo_file.rsplit('.', 1)[0])
+                        
         except Exception as e:
             print(f"Skipping {logo_file} due to error: {e}")
             continue
             
-    return detected_logos
+    # Return unique values only to prevent duplicates
+    return list(set(detected_logos)) 
 
 def extract_all_features(image, precomputed_symbols, logo_folder="logos"):
     """Master function to extract Text, Barcodes, Logos, and append Symbols"""
@@ -158,7 +173,7 @@ def extract_all_features(image, precomputed_symbols, logo_folder="logos"):
     for bc in barcodes:
         features.append({"Type": "Barcode", "Value": bc})
 
-    # 2. Logo / Image Extraction
+    # 2. Logo / Image Extraction (Now powered by RANSAC)
     logos = detect_logos(image, logo_folder)
     for logo in logos:
         features.append({"Type": "Image", "Value": f"Image - {logo}"})
