@@ -228,9 +228,8 @@ def align_images(imageA, imageB):
 
 def _merge_nearby_boxes(boxes, y_gap=45, x_overlap_pct=0.25):
     """
-    Merge bounding boxes that are vertically close and horizontally overlapping.
-    Used to consolidate adjacent "changed" fragments that belong to the same
-    text block (e.g. a multilingual section that shifted due to a deleted line).
+    Merge boxes that are vertically close and horizontally overlapping.
+    Used for layout-reflow detection on CHANGED candidates.
     """
     if not boxes:
         return []
@@ -242,6 +241,37 @@ def _merge_nearby_boxes(boxes, y_gap=45, x_overlap_pct=0.25):
         ox = max(0, min(bx + bw, lx + lw) - max(bx, lx))
         horiz_ok = ox / max(bw, lw, 1) > x_overlap_pct
         if vert_close and horiz_ok:
+            nx, ny = min(lx, bx), min(ly, by)
+            merged[-1] = [nx, ny, max(lx + lw, bx + bw) - nx,
+                          max(ly + lh, by + bh) - ny]
+        else:
+            merged.append([bx, by, bw, bh])
+    return [tuple(b) for b in merged]
+
+
+def _merge_same_row_boxes(boxes, y_tol=8, x_gap=40):
+    """
+    Merge boxes on the same text line separated by a small horizontal gap.
+    Fixes cases like "REV." and "A" being detected as two separate boxes
+    when they belong to the same token "REV. A".
+
+    y_tol  — boxes whose vertical centres differ by ≤ y_tol px are on same row
+    x_gap  — boxes within x_gap px horizontally (after sorting left-to-right) are merged
+    """
+    if not boxes:
+        return []
+    boxes = sorted(boxes, key=lambda b: b[0])  # sort left to right
+    merged = [list(boxes[0])]
+    for bx, by, bw, bh in boxes[1:]:
+        lx, ly, lw, lh = merged[-1]
+        # vertical centre proximity
+        cy_last = ly + lh / 2
+        cy_cur  = by + bh / 2
+        same_row = abs(cy_last - cy_cur) <= y_tol
+        # horizontal gap
+        gap = bx - (lx + lw)
+        close_enough = gap <= x_gap
+        if same_row and close_enough:
             nx, ny = min(lx, bx), min(ly, by)
             merged[-1] = [nx, ny, max(lx + lw, bx + bw) - nx,
                           max(ly + lh, by + bh) - ny]
@@ -264,14 +294,49 @@ def _ocr_wordset(gray, x, y, w, h, pad=8):
     return set(w for w in text.split() if len(w) > 2)
 
 
+def _ocr_chars(gray, x, y, w, h, pad=8):
+    """OCR a region and return all alphanumeric characters (for small-box comparison)."""
+    x1, y1 = max(0, x - pad), max(0, y - pad)
+    x2, y2 = min(gray.shape[1], x + w + pad), min(gray.shape[0], y + h + pad)
+    crop = gray[y1:y2, x1:x2]
+    if crop.size == 0:
+        return ''
+    crop = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    text = pytesseract.image_to_string(crop, config='--psm 6',
+                                       lang='eng+fra+deu').strip()
+    return re.sub(r'[^A-Za-z0-9]', '', text).lower()
+
+
+def _is_same_content(chars_a, chars_b, threshold=0.65):
+    """
+    True if two short OCR strings share enough characters to be the same content.
+    Uses longest-common-subsequence style ratio to handle OCR noise/garbage chars.
+    Handles cases like "RE 1035-65-00" vs "REF) 1035-65-000" from scan variation.
+    """
+    if not chars_a and not chars_b:
+        return True   # both empty → same
+    if not chars_a or not chars_b:
+        return False  # one empty → different
+    if len(chars_a) < 2 and len(chars_b) < 2:
+        return True   # both too short to OCR reliably → suppress
+    # Containment check (handles partial OCR reads of the same token)
+    shorter, longer = (chars_a, chars_b) if len(chars_a) <= len(chars_b) else (chars_b, chars_a)
+    if shorter in longer:
+        return True
+    # Count common characters (order-independent, handles scrambled OCR)
+    # Use multiset intersection: sum of min(count_a[c], count_b[c])
+    from collections import Counter
+    ca, cb = Counter(chars_a), Counter(chars_b)
+    common = sum((ca & cb).values())
+    total  = max(len(chars_a), len(chars_b))
+    return (common / total) >= threshold if total else True
+
+
 def _is_layout_reflow(words_a, words_b, overlap_thresh=0.55, min_words=3):
     """
-    Returns True if the two word sets are similar enough to conclude the
-    "change" is just a layout reflow (e.g. text shifted up because a line
-    above it was deleted), not a real content change.
-
-    Requires min_words on at least one side to avoid suppressing boxes
-    where OCR reads nothing (symbols, barcodes) — those are handled elsewhere.
+    True if two OCR word-sets are similar enough to be a layout reflow
+    (text shifted because a line above was deleted), not real content change.
+    Requires min_words to avoid suppressing symbol/barcode areas.
     """
     if len(words_a) < min_words and len(words_b) < min_words:
         return False
@@ -286,30 +351,25 @@ def find_differences(imageA, imageB, min_area=80):
     """
     Robust difference detection for white-background medical labels.
 
-    WHY absdiff INSTEAD OF SSIM:
-    SSIM-based detection requires a "both-white" suppression mask to handle
-    white label backgrounds. The dilation of that mask physically overlaps
-    real deletion regions (e.g. a missing text line surrounded by white space),
-    causing genuine changes to be silently dropped from the report.
-    Direct absdiff is immune to this — it only fires where pixels actually differ.
-
     PIPELINE:
-    1. absdiff + threshold(25)  → catch every changed pixel
-    2. Morphological close(4×4) → merge letter fragments into word-level blobs
-    3. Per-box ink classification:
-         DELETED  — base has ink (<200), child is white  → always report
-         ADDED    — child has ink, base is white          → always report
-         CHANGED  — both have ink                        → needs further check
-         (neither) → white padding / margin noise        → suppress
-    4. For CHANGED boxes: local SSIM check
-         > 0.75 → same content, minor scan/print density diff → suppress
-         ≤ 0.75 → different content → keep as candidate
-    5. CHANGED candidates: merge vertically adjacent boxes, then OCR both sides.
-         If word overlap ≥ 55% with ≥3 words → layout reflow (line deleted above
-         caused everything below to shift up) → suppress.
-         Otherwise → genuine text change → report.
+    1. absdiff + threshold(25) → every changed pixel
+    2. Morphological close(4×4) → connect letter fragments into word blobs
+    3. Classify by ink presence (<200):
+         DELETED  — base has ink, child blank  → merge same-row fragments → report
+         ADDED    — child has ink, base blank  → merge same-row fragments → report
+         CHANGED  — both have ink             → further filtering (steps 4-5)
+         (neither) → white padding noise      → suppress
+    4. CHANGED — local SSIM > 0.75 → rendering drift (same content, diff scan
+       density) → suppress without OCR.
+    5. CHANGED candidates → merge vertically adjacent → OCR both sides:
+         a. Large boxes (≥3 words): word overlap ≥55% → layout reflow → suppress
+         b. Small boxes (<3 words): char overlap ≥75% → same content → suppress
+            This catches scan-variation noise on individual tokens (REF, LOT,
+            dates, dimension values) that appear "changed" due to ink density.
+    6. Surviving CHANGED boxes → report.
 
-    Scale-pad alignment padding: naturally suppressed in step 3 (both sides white).
+    FIX for "REV. A" split: step 3 applies _merge_same_row_boxes with 40px
+    x-gap tolerance after classifying, so "REV." and "A" are joined before OCR.
     """
     try:
         if imageA.size != imageB.size:
@@ -318,10 +378,9 @@ def find_differences(imageA, imageB, min_area=80):
         grayA = cv2.cvtColor(np.array(imageA), cv2.COLOR_RGB2GRAY)
         grayB = cv2.cvtColor(np.array(imageB), cv2.COLOR_RGB2GRAY)
 
-        # Keep overall SSIM for the UI similarity metric only
         overall_score, _ = ssim(grayA, grayB, full=True)
 
-        # Step 1-2: pixel diff → word-level blobs
+        # Steps 1-2
         abs_diff = cv2.absdiff(grayA, grayB)
         _, raw_thresh = cv2.threshold(abs_diff, 25, 255, cv2.THRESH_BINARY)
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 4))
@@ -329,46 +388,69 @@ def find_differences(imageA, imageB, min_area=80):
         cnts, _ = cv2.findContours(raw_thresh.copy(), cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
 
-        MIN_DARK = 10
-        bboxes_del, bboxes_add, changed_candidates = [], [], []
+        # INK_THRESHOLD: pixel value below which a pixel is considered "ink".
+        # 180 is tighter than 200 to avoid classifying light scan noise as ink.
+        INK_THRESHOLD = 180
+        MIN_DARK      = 10   # minimum ink pixels to consider a region "has content"
+        # INK_RATIO: if one side has this many times more ink than the other,
+        # classify as DELETED or ADDED rather than CHANGED.
+        # Handles cases like "REV. A" where the child has ~40 noise pixels
+        # vs the base's ~670 real ink pixels (ratio ≈16x → clearly deleted).
+        INK_RATIO     = 5.0
 
-        # Step 3-4: classify each box
+        raw_del, raw_add, changed_candidates = [], [], []
+
+        # Step 3 — classify
         for c in cnts:
             if cv2.contourArea(c) < min_area:
                 continue
             x, y, w, h = cv2.boundingRect(c)
             b_crop = grayA[y:y + h, x:x + w]
             c_crop = grayB[y:y + h, x:x + w]
-            has_base  = np.sum(b_crop < 200) > MIN_DARK
-            has_child = np.sum(c_crop < 200) > MIN_DARK
+            dark_b = np.sum(b_crop < INK_THRESHOLD)
+            dark_c = np.sum(c_crop < INK_THRESHOLD)
+            has_base  = dark_b > MIN_DARK
+            has_child = dark_c > MIN_DARK
 
-            if has_base and not has_child:
-                bboxes_del.append((x, y, w, h))
-
-            elif not has_base and has_child:
-                bboxes_add.append((x, y, w, h))
-
+            if has_base and (not has_child or dark_b > dark_c * INK_RATIO):
+                raw_del.append((x, y, w, h))
+            elif has_child and (not has_base or dark_c > dark_b * INK_RATIO):
+                raw_add.append((x, y, w, h))
             elif has_base and has_child and w >= 7 and h >= 7:
                 local_score, _ = ssim(b_crop, c_crop, full=True)
                 if local_score <= 0.75:
                     changed_candidates.append((x, y, w, h))
 
-        # Step 5: merge adjacent changed boxes, then OCR-filter layout reflows
+        # Merge same-row fragments for DELETED and ADDED (fixes "REV. A" split)
+        bboxes_del = _merge_same_row_boxes(raw_del, y_tol=8, x_gap=40)
+        bboxes_add = _merge_same_row_boxes(raw_add, y_tol=8, x_gap=40)
+
+        # Steps 4-5 — filter CHANGED candidates
         merged_changed = _merge_nearby_boxes(changed_candidates)
         bboxes_chg = []
         for (x, y, w, h) in merged_changed:
             words_a = _ocr_wordset(grayA, x, y, w, h)
             words_b = _ocr_wordset(grayB, x, y, w, h)
-            if not _is_layout_reflow(words_a, words_b):
-                bboxes_chg.append((x, y, w, h))
+
+            if _is_layout_reflow(words_a, words_b):
+                continue   # layout reflow → suppress
+
+            # For small boxes (scan-density noise on tokens like REF, LOT, dates)
+            # use character-level comparison
+            if len(words_a) < 3 and len(words_b) < 3:
+                chars_a = _ocr_chars(grayA, x, y, w, h)
+                chars_b = _ocr_chars(grayB, x, y, w, h)
+                if _is_same_content(chars_a, chars_b):
+                    continue   # same content, scan variation → suppress
+
+            bboxes_chg.append((x, y, w, h))
 
         all_bboxes = bboxes_del + bboxes_add + bboxes_chg
 
         return {
-            'ssim_score':       overall_score,
-            'bounding_boxes':   all_bboxes,
+            'ssim_score':        overall_score,
+            'bounding_boxes':    all_bboxes,
             'total_differences': len(all_bboxes),
-            # Expose split lists so classify_text_boxes can reuse them
             '_deleted': bboxes_del,
             '_added':   bboxes_add,
             '_changed': bboxes_chg,
