@@ -38,12 +38,15 @@ st.markdown("""
 # TEMPLATE MATCHING SYMBOL DETECTOR
 # ---------------------------------------------------------
 def detect_symbols_template(image, symbol_folder="symbols", threshold=0.75):
+    """Detects symbols dynamically across a wide range of sizes and angles"""
     if not os.path.exists(symbol_folder):
         return []
         
     img_np = np.array(image)
     if len(img_np.shape) == 3 and img_np.shape[2] == 3:
         img_gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    elif len(img_np.shape) == 3 and img_np.shape[2] == 4:
+        img_gray = cv2.cvtColor(img_np, cv2.COLOR_RGBA2GRAY)
     else:
         img_gray = img_np
         
@@ -63,10 +66,11 @@ def detect_symbols_template(image, symbol_folder="symbols", threshold=0.75):
         
         symbol_name = os.path.splitext(symbol_file)[0]
         
-        for scale in [0.75, 1.0, 1.25]:
+        # Extended scales to guarantee detection regardless of resolution
+        for scale in [0.1, 0.2, 0.3, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5]:
             width = int(symbol_img.shape[1] * scale)
             height = int(symbol_img.shape[0] * scale)
-            if width == 0 or height == 0 or width > img_enhanced.shape[1] or height > img_enhanced.shape[0]:
+            if width < 10 or height < 10 or width > img_enhanced.shape[1] or height > img_enhanced.shape[0]:
                 continue
                 
             resized_sym = cv2.resize(symbol_img, (width, height), interpolation=cv2.INTER_AREA)
@@ -259,12 +263,16 @@ def draw_symbol_boxes(image, detections, color_map=None, thickness=2):
             "Added": (0,255,0), 
             "Removed": (255,0,0), 
             "Misplaced": (255,165,0),  
-            "Symbol": (0,0,255) 
+            "Present": (0,0,0)  # Present falls back, but is actively filtered out below
         }
         
     for d in detections:
-        x1, y1, x2, y2 = map(int, d["bbox"])
+        # Prevent "Present" symbols from receiving a bounding box
         label = d.get("label", "Symbol")
+        if label == "Present":
+            continue
+            
+        x1, y1, x2, y2 = map(int, d["bbox"])
         color = color_map.get(label, (0,0,255))
         draw.rectangle([x1, y1, x2, y2], outline=color, width=thickness)
         draw.text((x1, max(0, y1-15)), label, fill=color)
@@ -312,6 +320,7 @@ def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=85):
 def ocr_crop(image, box):
     x, y, w, h = box
     pad = 5
+    
     img_width = image.shape[1] if isinstance(image, np.ndarray) else image.width
     img_height = image.shape[0] if isinstance(image, np.ndarray) else image.height
     
@@ -326,6 +335,7 @@ def ocr_crop(image, box):
         
     gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
     text = pytesseract.image_to_string(gray, lang='eng+fra+deu', config='--psm 6').strip()
+    
     text = re.sub(r'[|><_~=«»"*;]', '', text).strip()
     text = re.sub(r'\n+', ' ', text) 
     return text
@@ -354,7 +364,9 @@ if compare_clicked:
             raw_base_img = process_upload(base_file)
             base_processed = preprocess_image(raw_base_img, enhance_contrast=False)
             
+            # Using new Template Matching logic for symbols
             base_symbols_raw = detect_symbols_template(base_processed, symbol_folder="symbols")
+            # This ensures they populate the Base Features table immediately
             base_features_df = extract_all_features(raw_base_img, base_symbols_raw, logo_folder="logos")
             
             base_symbols = []
@@ -375,17 +387,17 @@ if compare_clicked:
                     if not aligned_success:
                         comp_aligned = comp_processed
                     
+                    # Using new Template Matching logic for symbols
                     comp_symbols_raw = detect_symbols_template(comp_aligned, symbol_folder="symbols")
+                    # This ensures they populate the Child Features table immediately
                     comp_features_df = extract_all_features(comp_aligned, comp_symbols_raw, logo_folder="logos")
                         
                     diff_results = find_differences(base_processed, comp_aligned, threshold=0.85, min_area=150)
+                    
                     if not diff_results:
                         st.error(f"Error comparing '{child_file.name}'")
                         continue
                         
-                    # -------------------------------------------------------------
-                    # FIX: DISTANCE CLAIMING ALGORITHM (Prevents Duplicate Misplaced)
-                    # -------------------------------------------------------------
                     comp_symbols_final = []
                     dynamic_threshold = base_processed.width * 0.05 
                     claimed_child_indices = set()
@@ -395,7 +407,6 @@ if compare_clicked:
                         min_dist = float('inf')
                         best_idx = -1
                         
-                        # Find the physically closest symbol of the same type
                         for idx, c_sym in enumerate(comp_symbols_raw):
                             if c_sym["class"] == base_sym["class"] and idx not in claimed_child_indices:
                                 c1 = get_center(base_sym["bbox"])
@@ -408,17 +419,20 @@ if compare_clicked:
                                     
                         if best_match is not None:
                             claimed_child_indices.add(best_idx)
-                            # If it shifted beyond the threshold, it is Misplaced. Otherwise, IGNORE IT.
                             if min_dist > dynamic_threshold:
                                 misplaced_box = best_match.copy()
                                 misplaced_box["label"] = "Misplaced"
                                 comp_symbols_final.append(misplaced_box)
+                            else:
+                                # THE FIX: Tag it as Present so it remains in memory but is ignored by the bounding box renderer
+                                present_box = best_match.copy()
+                                present_box["label"] = "Present"
+                                comp_symbols_final.append(present_box)
                         else:
                             missing_box = base_sym.copy()
                             missing_box["label"] = "Removed"
                             comp_symbols_final.append(missing_box)
 
-                    # Any child symbols never claimed by a base symbol are Newly Added
                     for idx, c_sym in enumerate(comp_symbols_raw):
                         if idx not in claimed_child_indices:
                             added_box = c_sym.copy()
@@ -466,22 +480,15 @@ if compare_clicked:
                         elif has_content_b and has_content_c:
                             changed_boxes.append((x, y, w, h))
 
-                    # -------------------------------------------------------------
-                    # FIX: LOGICAL VISUAL RENDERING
-                    # -------------------------------------------------------------
-                    # Separate symbol boxes so "Removed" shows on the Base label, 
-                    # and "Added/Misplaced" show on the Child label. Perfectly matching symbols are ignored!
                     removed_symbols = [s for s in comp_symbols if s["label"] == "Removed"]
                     added_misplaced_symbols = [s for s in comp_symbols if s["label"] in ["Added", "Misplaced"]]
 
                     base_marked = draw_differences(base_processed, actual_deleted_boxes, color=(255,0,0), label="Deleted")
                     base_marked = draw_differences(base_marked, changed_boxes, color=(23,162,184), label="Modified")
-                    # Draw "Removed" symbols ONLY on the base image
                     base_marked = draw_symbol_boxes(base_marked, removed_symbols, color_map={"Removed": (255,0,0)})
                     
                     comp_marked = draw_differences(comp_aligned, actual_added_boxes, color=(0,255,0), label="Added")
                     comp_marked = draw_differences(comp_marked, changed_boxes, color=(23,162,184), label="Modified")
-                    # Draw "Added" and "Misplaced" symbols ONLY on the child image
                     comp_marked = draw_symbol_boxes(comp_marked, added_misplaced_symbols, color_map={"Added": (0,255,0), "Misplaced": (255,165,0)})
 
                     st.markdown("---")
