@@ -35,8 +35,33 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------
-# TEMPLATE MATCHING SYMBOL DETECTOR
+# UI DATA INJECTION HELPER (Bypasses Extract.py Caching)
 # ---------------------------------------------------------
+def force_symbols_into_df(features_df, symbols_raw):
+    """Guarantees symbols appear in the Extracted Features table"""
+    if not symbols_raw:
+        return features_df
+        
+    symbol_entries = []
+    seen = set()
+    
+    if not features_df.empty and 'Type' in features_df.columns:
+        seen = set(features_df[features_df['Type'] == 'Symbol']['Value'].tolist())
+        
+    for sym in symbols_raw:
+        val = sym["class"]
+        if val not in seen:
+            symbol_entries.append({"Type": "Symbol", "Value": val})
+            seen.add(val)
+            
+    if symbol_entries:
+        if features_df.empty:
+            return pd.DataFrame(symbol_entries)
+        else:
+            return pd.concat([features_df, pd.DataFrame(symbol_entries)], ignore_index=True)
+            
+    return features_df
+
 # ---------------------------------------------------------
 # TEMPLATE MATCHING SYMBOL DETECTOR (STABLE VERSION)
 # ---------------------------------------------------------
@@ -52,7 +77,6 @@ def detect_symbols_template(image, symbol_folder="symbols", threshold=0.80):
     else:
         img_gray = img_np
         
-    # Enhance base image
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     img_enhanced = clahe.apply(img_gray)
     
@@ -68,22 +92,17 @@ def detect_symbols_template(image, symbol_folder="symbols", threshold=0.80):
         if symbol_img is None: continue
         
         symbol_name = os.path.splitext(symbol_file)[0]
-        
-        # CRITICAL FIX: Enhance the template image so it matches the label's contrast!
         symbol_enhanced = clahe.apply(symbol_img)
         
-        # Restricted to a few sensible scales to prevent hallucination explosions
         for scale in [0.8, 0.9, 1.0, 1.1, 1.2]:
             width = int(symbol_enhanced.shape[1] * scale)
             height = int(symbol_enhanced.shape[0] * scale)
             
-            # CRITICAL FIX: Prevent OpenCV crashes if template is larger than image
             if width < 10 or height < 10 or width > img_enhanced.shape[1] or height > img_enhanced.shape[0]:
                 continue
                 
             resized_sym = cv2.resize(symbol_enhanced, (width, height), interpolation=cv2.INTER_AREA)
             
-            # Strict Template Matching
             res = cv2.matchTemplate(img_enhanced, resized_sym, cv2.TM_CCOEFF_NORMED)
             loc = np.where(res >= threshold)
             
@@ -92,7 +111,6 @@ def detect_symbols_template(image, symbol_folder="symbols", threshold=0.80):
                 x2, y2 = x1 + width, y1 + height
                 conf = float(res[y1, x1])
                 
-                # Strict Non-Maximum Suppression (Prevents duplicate boxes on the same symbol)
                 overlap = False
                 for d in detections:
                     if d['class'] == symbol_name:
@@ -104,7 +122,6 @@ def detect_symbols_template(image, symbol_folder="symbols", threshold=0.80):
                             box1Area = (x2 - x1) * (y2 - y1)
                             box2Area = (dx2 - dx1) * (dy2 - dy1)
                             iou = interArea / float(box1Area + box2Area - interArea)
-                            # If boxes overlap by more than 10%, only keep the highest confidence one
                             if iou > 0.1: 
                                 overlap = True
                                 if conf > d['confidence']:
@@ -260,11 +277,10 @@ def draw_symbol_boxes(image, detections, color_map=None, thickness=2):
             "Added": (0,255,0), 
             "Removed": (255,0,0), 
             "Misplaced": (255,165,0),  
-            "Present": (0,0,0)  # Present falls back, but is actively filtered out below
+            "Present": (0,0,0)  
         }
         
     for d in detections:
-        # Prevent "Present" symbols from receiving a bounding box
         label = d.get("label", "Symbol")
         if label == "Present":
             continue
@@ -317,7 +333,6 @@ def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=85):
 def ocr_crop(image, box):
     x, y, w, h = box
     pad = 5
-    
     img_width = image.shape[1] if isinstance(image, np.ndarray) else image.width
     img_height = image.shape[0] if isinstance(image, np.ndarray) else image.height
     
@@ -361,10 +376,11 @@ if compare_clicked:
             raw_base_img = process_upload(base_file)
             base_processed = preprocess_image(raw_base_img, enhance_contrast=False)
             
-            # Using new Template Matching logic for symbols
             base_symbols_raw = detect_symbols_template(base_processed, symbol_folder="symbols")
-            # This ensures they populate the Base Features table immediately
             base_features_df = extract_all_features(raw_base_img, base_symbols_raw, logo_folder="logos")
+            
+            # CRITICAL FIX: Force inject symbols into DataFrame to bypass Streamlit Caching bugs
+            base_features_df = force_symbols_into_df(base_features_df, base_symbols_raw)
             
             base_symbols = []
             for d in base_symbols_raw:
@@ -384,13 +400,13 @@ if compare_clicked:
                     if not aligned_success:
                         comp_aligned = comp_processed
                     
-                    # Using new Template Matching logic for symbols
                     comp_symbols_raw = detect_symbols_template(comp_aligned, symbol_folder="symbols")
-                    # This ensures they populate the Child Features table immediately
                     comp_features_df = extract_all_features(comp_aligned, comp_symbols_raw, logo_folder="logos")
+                    
+                    # CRITICAL FIX: Force inject symbols into DataFrame to bypass Streamlit Caching bugs
+                    comp_features_df = force_symbols_into_df(comp_features_df, comp_symbols_raw)
                         
                     diff_results = find_differences(base_processed, comp_aligned, threshold=0.85, min_area=150)
-                    
                     if not diff_results:
                         st.error(f"Error comparing '{child_file.name}'")
                         continue
@@ -421,7 +437,6 @@ if compare_clicked:
                                 misplaced_box["label"] = "Misplaced"
                                 comp_symbols_final.append(misplaced_box)
                             else:
-                                # THE FIX: Tag it as Present so it remains in memory but is ignored by the bounding box renderer
                                 present_box = best_match.copy()
                                 present_box["label"] = "Present"
                                 comp_symbols_final.append(present_box)
