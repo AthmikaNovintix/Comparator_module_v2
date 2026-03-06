@@ -226,43 +226,153 @@ def align_images(imageA, imageB):
 # DIFFERENCE DETECTION
 # ============================================================
 
-def find_differences(imageA, imageB, min_area=150):
+def _merge_nearby_boxes(boxes, y_gap=45, x_overlap_pct=0.25):
     """
-    SSIM pixel diff with two noise-suppression masks:
+    Merge bounding boxes that are vertically close and horizontally overlapping.
+    Used to consolidate adjacent "changed" fragments that belong to the same
+    text block (e.g. a multilingual section that shifted due to a deleted line).
+    """
+    if not boxes:
+        return []
+    boxes = sorted(boxes, key=lambda b: b[1])
+    merged = [list(boxes[0])]
+    for bx, by, bw, bh in boxes[1:]:
+        lx, ly, lw, lh = merged[-1]
+        vert_close = by <= (ly + lh + y_gap)
+        ox = max(0, min(bx + bw, lx + lw) - max(bx, lx))
+        horiz_ok = ox / max(bw, lw, 1) > x_overlap_pct
+        if vert_close and horiz_ok:
+            nx, ny = min(lx, bx), min(ly, by)
+            merged[-1] = [nx, ny, max(lx + lw, bx + bw) - nx,
+                          max(ly + lh, by + bh) - ny]
+        else:
+            merged.append([bx, by, bw, bh])
+    return [tuple(b) for b in merged]
 
-    1. Both-white mask  — suppresses white padding from scale+pad alignment
-    2. Morphological close — merges nearby micro-contours to avoid
-       fragmenting one real change into dozens of tiny boxes
+
+def _ocr_wordset(gray, x, y, w, h, pad=8):
+    """OCR a region and return its meaningful words as a set (for overlap comparison)."""
+    x1, y1 = max(0, x - pad), max(0, y - pad)
+    x2, y2 = min(gray.shape[1], x + w + pad), min(gray.shape[0], y + h + pad)
+    crop = gray[y1:y2, x1:x2]
+    if crop.size == 0:
+        return set()
+    crop = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    text = pytesseract.image_to_string(crop, config='--psm 6',
+                                       lang='eng+fra+deu').strip()
+    text = re.sub(r'[^A-Za-z0-9\s]', '', text).lower()
+    return set(w for w in text.split() if len(w) > 2)
+
+
+def _is_layout_reflow(words_a, words_b, overlap_thresh=0.55, min_words=3):
+    """
+    Returns True if the two word sets are similar enough to conclude the
+    "change" is just a layout reflow (e.g. text shifted up because a line
+    above it was deleted), not a real content change.
+
+    Requires min_words on at least one side to avoid suppressing boxes
+    where OCR reads nothing (symbols, barcodes) — those are handled elsewhere.
+    """
+    if len(words_a) < min_words and len(words_b) < min_words:
+        return False
+    if not words_a or not words_b:
+        return False
+    inter = len(words_a & words_b)
+    union = len(words_a | words_b)
+    return (inter / union) >= overlap_thresh
+
+
+def find_differences(imageA, imageB, min_area=80):
+    """
+    Robust difference detection for white-background medical labels.
+
+    WHY absdiff INSTEAD OF SSIM:
+    SSIM-based detection requires a "both-white" suppression mask to handle
+    white label backgrounds. The dilation of that mask physically overlaps
+    real deletion regions (e.g. a missing text line surrounded by white space),
+    causing genuine changes to be silently dropped from the report.
+    Direct absdiff is immune to this — it only fires where pixels actually differ.
+
+    PIPELINE:
+    1. absdiff + threshold(25)  → catch every changed pixel
+    2. Morphological close(4×4) → merge letter fragments into word-level blobs
+    3. Per-box ink classification:
+         DELETED  — base has ink (<200), child is white  → always report
+         ADDED    — child has ink, base is white          → always report
+         CHANGED  — both have ink                        → needs further check
+         (neither) → white padding / margin noise        → suppress
+    4. For CHANGED boxes: local SSIM check
+         > 0.75 → same content, minor scan/print density diff → suppress
+         ≤ 0.75 → different content → keep as candidate
+    5. CHANGED candidates: merge vertically adjacent boxes, then OCR both sides.
+         If word overlap ≥ 55% with ≥3 words → layout reflow (line deleted above
+         caused everything below to shift up) → suppress.
+         Otherwise → genuine text change → report.
+
+    Scale-pad alignment padding: naturally suppressed in step 3 (both sides white).
     """
     try:
         if imageA.size != imageB.size:
             imageB = imageB.resize(imageA.size, Image.Resampling.LANCZOS)
+
         grayA = cv2.cvtColor(np.array(imageA), cv2.COLOR_RGB2GRAY)
         grayB = cv2.cvtColor(np.array(imageB), cv2.COLOR_RGB2GRAY)
 
-        score, diff = ssim(grayA, grayB, full=True)
-        diff = (diff * 255).astype("uint8")
-        thresh = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+        # Keep overall SSIM for the UI similarity metric only
+        overall_score, _ = ssim(grayA, grayB, full=True)
 
-        # Suppress regions where both images are pure white (padding / margins)
-        both_white = ((grayA > 245) & (grayB > 245)).astype(np.uint8) * 255
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-        both_white = cv2.dilate(both_white, k, iterations=2)
-        thresh = cv2.bitwise_and(thresh, cv2.bitwise_not(both_white))
+        # Step 1-2: pixel diff → word-level blobs
+        abs_diff = cv2.absdiff(grayA, grayB)
+        _, raw_thresh = cv2.threshold(abs_diff, 25, 255, cv2.THRESH_BINARY)
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 4))
+        raw_thresh = cv2.morphologyEx(raw_thresh, cv2.MORPH_CLOSE, k)
+        cnts, _ = cv2.findContours(raw_thresh.copy(), cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
 
-        # Merge very close diff fragments into coherent regions
-        merge_k = cv2.getStructuringElement(cv2.MORPH_RECT, (8, 8))
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, merge_k)
+        MIN_DARK = 10
+        bboxes_del, bboxes_add, changed_candidates = [], [], []
 
-        cnts = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cnts = imutils.grab_contours(cnts)
-        bboxes = []
+        # Step 3-4: classify each box
         for c in cnts:
-            if cv2.contourArea(c) > min_area:
-                x, y, w, h = cv2.boundingRect(c)
-                bboxes.append((x, y, w, h))
+            if cv2.contourArea(c) < min_area:
+                continue
+            x, y, w, h = cv2.boundingRect(c)
+            b_crop = grayA[y:y + h, x:x + w]
+            c_crop = grayB[y:y + h, x:x + w]
+            has_base  = np.sum(b_crop < 200) > MIN_DARK
+            has_child = np.sum(c_crop < 200) > MIN_DARK
 
-        return {'ssim_score': score, 'bounding_boxes': bboxes, 'total_differences': len(bboxes)}
+            if has_base and not has_child:
+                bboxes_del.append((x, y, w, h))
+
+            elif not has_base and has_child:
+                bboxes_add.append((x, y, w, h))
+
+            elif has_base and has_child and w >= 7 and h >= 7:
+                local_score, _ = ssim(b_crop, c_crop, full=True)
+                if local_score <= 0.75:
+                    changed_candidates.append((x, y, w, h))
+
+        # Step 5: merge adjacent changed boxes, then OCR-filter layout reflows
+        merged_changed = _merge_nearby_boxes(changed_candidates)
+        bboxes_chg = []
+        for (x, y, w, h) in merged_changed:
+            words_a = _ocr_wordset(grayA, x, y, w, h)
+            words_b = _ocr_wordset(grayB, x, y, w, h)
+            if not _is_layout_reflow(words_a, words_b):
+                bboxes_chg.append((x, y, w, h))
+
+        all_bboxes = bboxes_del + bboxes_add + bboxes_chg
+
+        return {
+            'ssim_score':       overall_score,
+            'bounding_boxes':   all_bboxes,
+            'total_differences': len(all_bboxes),
+            # Expose split lists so classify_text_boxes can reuse them
+            '_deleted': bboxes_del,
+            '_added':   bboxes_add,
+            '_changed': bboxes_chg,
+        }
     except Exception as e:
         st.error(f"Error finding differences: {e}")
         return None
@@ -364,69 +474,33 @@ def compare_symbols(base_symbols_raw, comp_symbols_raw, base_img, comp_aligned):
 # TEXT DIFF CLASSIFICATION
 # ============================================================
 
-def classify_text_boxes(ssim_boxes, base_symbols, comp_symbols,
-                        base_img, comp_aligned):
+def classify_text_boxes(diff_results, base_symbols, comp_symbols):
     """
-    Takes raw SSIM bounding boxes and classifies each as:
-      Added / Deleted / Changed
+    Applies the symbol-overlap filter to the pre-classified diff boxes
+    from find_differences() to prevent double-reporting symbol changes
+    as both a symbol event and a text event.
 
-    Steps:
-    1. Exclude boxes that overlap with known symbol regions
-       (symbols are handled separately — no double-reporting)
-    2. For each remaining box, sample dark-pixel density in both
-       images to determine what kind of change it is
-    3. Run OCR only on confirmed diff boxes (not every SSIM fragment)
-    4. Suppress OCR hallucinations: discard results that are purely
-       punctuation / whitespace / fewer than 2 alphanumeric chars
-
-    Handles:
-      • Pure text change (LOT number, date)     → Changed
-      • New text block (added language row)     → Added
-      • Deleted text block                      → Deleted
-      • Noise boxes on white padding            → suppressed by dark-pixel check
-      • OCR reading barcode as garbled text     → suppressed by alphanumeric filter
+    diff_results must contain '_deleted', '_added', '_changed' keys
+    (populated by find_differences).
     """
     all_sym_bboxes = []
     for s in list(base_symbols) + list(comp_symbols):
         x1, y1, x2, y2 = map(int, s["bbox"])
         all_sym_bboxes.append((x1, y1, x2 - x1, y2 - y1))
 
-    def overlaps_any_symbol(box):
+    def overlaps_symbol(box):
         bx, by, bw, bh = box
-        bc = [bx, by, bx + bw, by + bh]
         for sx, sy, sw, sh in all_sym_bboxes:
-            sc = [sx, sy, sx + sw, sy + sh]
-            xA, yA = max(bc[0], sc[0]), max(bc[1], sc[1])
-            xB, yB = min(bc[2], sc[2]), min(bc[3], sc[3])
+            xA = max(bx, sx);           yA = max(by, sy)
+            xB = min(bx + bw, sx + sw); yB = min(by + bh, sy + sh)
             inter = max(0, xB - xA) * max(0, yB - yA)
-            if inter > 0:
-                area_b = bw * bh
-                if area_b > 0 and inter / area_b > 0.25:
-                    return True
+            if inter > 0 and bw * bh > 0 and inter / (bw * bh) > 0.25:
+                return True
         return False
 
-    base_gray = cv2.cvtColor(np.array(base_img), cv2.COLOR_RGB2GRAY)
-    child_gray = cv2.cvtColor(np.array(comp_aligned), cv2.COLOR_RGB2GRAY)
-    MIN_DARK = 15
-
-    deleted, added, changed = [], [], []
-
-    for (x, y, w, h) in ssim_boxes:
-        if overlaps_any_symbol((x, y, w, h)):
-            continue
-        crop_b = base_gray[y:y + h, x:x + w]
-        crop_c = child_gray[y:y + h, x:x + w]
-        if crop_b.size == 0 or crop_c.size == 0:
-            continue
-        has_b = np.sum(crop_b < 220) > MIN_DARK
-        has_c = np.sum(crop_c < 220) > MIN_DARK
-
-        if has_b and not has_c:
-            deleted.append((x, y, w, h))
-        elif not has_b and has_c:
-            added.append((x, y, w, h))
-        elif has_b and has_c:
-            changed.append((x, y, w, h))
+    deleted = [b for b in diff_results.get('_deleted', []) if not overlaps_symbol(b)]
+    added   = [b for b in diff_results.get('_added',   []) if not overlaps_symbol(b)]
+    changed = [b for b in diff_results.get('_changed',  []) if not overlaps_symbol(b)]
 
     return deleted, added, changed
 
@@ -579,8 +653,8 @@ if compare_clicked:
                     comp_features_df = extract_all_features(comp_aligned, comp_symbols_raw,
                                                             logo_folder="logos")
 
-                    # STEP 4 — SSIM pixel diff
-                    diff_results = find_differences(base_processed, comp_aligned, min_area=150)
+                    # STEP 4 — Pixel diff (absdiff + reflow filter)
+                    diff_results = find_differences(base_processed, comp_aligned)
                     if not diff_results:
                         st.error(f"Error comparing '{child_file.name}'")
                         continue
@@ -591,11 +665,10 @@ if compare_clicked:
                         base_processed, comp_aligned
                     )
 
-                    # STEP 6 — Classify text diff boxes
+                    # STEP 6 — Filter diff boxes against symbol regions
                     deleted_boxes, added_boxes, changed_boxes = classify_text_boxes(
-                        diff_results['bounding_boxes'],
-                        base_symbols_draw, comp_symbols,
-                        base_processed, comp_aligned
+                        diff_results,
+                        base_symbols_draw, comp_symbols
                     )
 
                     # STEP 7 — OCR the diff boxes
