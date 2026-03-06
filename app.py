@@ -10,9 +10,9 @@ import imutils
 import math
 import pytesseract
 import re
+import os
 
 from rapidfuzz import fuzz
-from detect import run_detection_pil, get_center
 
 try:
     from Extract import extract_all_features
@@ -34,6 +34,98 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+# ---------------------------------------------------------
+# TEMPLATE MATCHING SYMBOL DETECTOR
+# ---------------------------------------------------------
+def detect_symbols_template(image, symbol_folder="symbols", threshold=0.75):
+    if not os.path.exists(symbol_folder):
+        return []
+        
+    img_np = np.array(image)
+    if len(img_np.shape) == 3 and img_np.shape[2] == 3:
+        img_gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    else:
+        img_gray = img_np
+        
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    img_enhanced = clahe.apply(img_gray)
+    
+    detections = []
+    valid_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
+    
+    for symbol_file in os.listdir(symbol_folder):
+        if not symbol_file.lower().endswith(valid_extensions):
+            continue
+            
+        symbol_path = os.path.join(symbol_folder, symbol_file)
+        symbol_img = cv2.imread(symbol_path, 0)
+        if symbol_img is None: continue
+        
+        symbol_name = os.path.splitext(symbol_file)[0]
+        
+        for scale in [0.75, 1.0, 1.25]:
+            width = int(symbol_img.shape[1] * scale)
+            height = int(symbol_img.shape[0] * scale)
+            if width == 0 or height == 0 or width > img_enhanced.shape[1] or height > img_enhanced.shape[0]:
+                continue
+                
+            resized_sym = cv2.resize(symbol_img, (width, height), interpolation=cv2.INTER_AREA)
+            
+            for angle in [0, 90, 180, 270]:
+                if angle == 0:
+                    rotated_sym = resized_sym
+                else:
+                    center = (width // 2, height // 2)
+                    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                    cos = np.abs(M[0, 0])
+                    sin = np.abs(M[0, 1])
+                    nW = int((height * sin) + (width * cos))
+                    nH = int((height * cos) + (width * sin))
+                    M[0, 2] += (nW / 2) - center[0]
+                    M[1, 2] += (nH / 2) - center[1]
+                    rotated_sym = cv2.warpAffine(resized_sym, M, (nW, nH), borderMode=cv2.BORDER_CONSTANT, borderValue=255)
+                    
+                res = cv2.matchTemplate(img_enhanced, rotated_sym, cv2.TM_CCOEFF_NORMED)
+                loc = np.where(res >= threshold)
+                
+                for pt in zip(*loc[::-1]):
+                    x1, y1 = pt[0], pt[1]
+                    x2, y2 = x1 + rotated_sym.shape[1], y1 + rotated_sym.shape[0]
+                    conf = float(res[y1, x1])
+                    
+                    overlap = False
+                    for d in detections:
+                        if d['class'] == symbol_name:
+                            dx1, dy1, dx2, dy2 = d['bbox']
+                            ixA = max(x1, dx1); iyA = max(y1, dy1)
+                            ixB = min(x2, dx2); iyB = min(y2, dy2)
+                            interArea = max(0, ixB - ixA) * max(0, iyB - iyA)
+                            if interArea > 0:
+                                box1Area = (x2 - x1) * (y2 - y1)
+                                box2Area = (dx2 - dx1) * (dy2 - dy1)
+                                iou = interArea / float(box1Area + box2Area - interArea)
+                                if iou > 0.3:
+                                    overlap = True
+                                    if conf > d['confidence']:
+                                        d['bbox'] = [x1, y1, x2, y2]
+                                        d['confidence'] = conf
+                                    break
+                    if not overlap:
+                        detections.append({
+                            "class": symbol_name,
+                            "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                            "confidence": conf,
+                            "label": "Symbol"
+                        })
+                        
+    return detections
+
+def get_center(bbox):
+    return ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
+
+# ---------------------------------------------------------
+# STANDARD PIPELINE
+# ---------------------------------------------------------
 def pdf_to_image(uploaded_file, dpi=200):
     pdf_bytes = uploaded_file.read()
     uploaded_file.seek(0)
@@ -166,7 +258,7 @@ def draw_symbol_boxes(image, detections, color_map=None, thickness=2):
         color_map = {
             "Added": (0,255,0), 
             "Removed": (255,0,0), 
-            "Misplaced": (255,165,0),  # Changed default to Orange
+            "Misplaced": (255,165,0),  
             "Symbol": (0,0,255) 
         }
         
@@ -195,7 +287,6 @@ def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=85):
         deleted = list(base_set - comp_set)
         return added, deleted
 
-    # Smarter token-based matching to ignore OCR noise
     for b_val in base_vals_list:
         match_found = False
         norm_b = b_val.lower().strip() 
@@ -219,10 +310,8 @@ def get_feature_diffs(base_df, comp_df, comp_type, fuzzy_threshold=85):
     return added, deleted
 
 def ocr_crop(image, box):
-    """Extracts text ONLY from the exact physical area that changed"""
     x, y, w, h = box
     pad = 5
-    
     img_width = image.shape[1] if isinstance(image, np.ndarray) else image.width
     img_height = image.shape[0] if isinstance(image, np.ndarray) else image.height
     
@@ -237,7 +326,6 @@ def ocr_crop(image, box):
         
     gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
     text = pytesseract.image_to_string(gray, lang='eng+fra+deu', config='--psm 6').strip()
-    
     text = re.sub(r'[|><_~=«»"*;]', '', text).strip()
     text = re.sub(r'\n+', ' ', text) 
     return text
@@ -266,8 +354,7 @@ if compare_clicked:
             raw_base_img = process_upload(base_file)
             base_processed = preprocess_image(raw_base_img, enhance_contrast=False)
             
-            # Run YOLO once and pass it down
-            base_symbols_raw = run_detection_pil(base_processed)
+            base_symbols_raw = detect_symbols_template(base_processed, symbol_folder="symbols")
             base_features_df = extract_all_features(raw_base_img, base_symbols_raw, logo_folder="logos")
             
             base_symbols = []
@@ -288,49 +375,53 @@ if compare_clicked:
                     if not aligned_success:
                         comp_aligned = comp_processed
                     
-                    # Run YOLO on child once and pass it down
-                    comp_symbols_raw = run_detection_pil(comp_aligned)
+                    comp_symbols_raw = detect_symbols_template(comp_aligned, symbol_folder="symbols")
                     comp_features_df = extract_all_features(comp_aligned, comp_symbols_raw, logo_folder="logos")
                         
                     diff_results = find_differences(base_processed, comp_aligned, threshold=0.85, min_area=150)
-                    
                     if not diff_results:
                         st.error(f"Error comparing '{child_file.name}'")
                         continue
                         
+                    # -------------------------------------------------------------
+                    # FIX: DISTANCE CLAIMING ALGORITHM (Prevents Duplicate Misplaced)
+                    # -------------------------------------------------------------
                     comp_symbols_final = []
+                    dynamic_threshold = base_processed.width * 0.05 
+                    claimed_child_indices = set()
                     
-                    def region_has_symbol(image, bbox, threshold=15):
-                        x1, y1, x2, y2 = map(int, bbox)
-                        crop = np.array(image)[y1:y2, x1:x2]
-                        if crop.size == 0: return False
-                        if len(crop.shape) == 3:
-                            crop_gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-                        else:
-                            crop_gray = crop
-                        non_bg = np.sum(crop_gray < 240)
-                        return non_bg > threshold
-
                     for base_sym in base_symbols_raw:
-                        matches = [c for c in comp_symbols_raw if c["class"] == base_sym["class"]]
-                        if matches:
-                            for match in matches:
+                        best_match = None
+                        min_dist = float('inf')
+                        best_idx = -1
+                        
+                        # Find the physically closest symbol of the same type
+                        for idx, c_sym in enumerate(comp_symbols_raw):
+                            if c_sym["class"] == base_sym["class"] and idx not in claimed_child_indices:
                                 c1 = get_center(base_sym["bbox"])
-                                c2 = get_center(match["bbox"])
+                                c2 = get_center(c_sym["bbox"])
                                 dist = math.dist(c1, c2)
-                                if dist > 40: 
-                                    if region_has_symbol(comp_aligned, match["bbox"]):
-                                        misplaced_box = match.copy()
-                                        misplaced_box["label"] = "Misplaced"
-                                        comp_symbols_final.append(misplaced_box)
+                                if dist < min_dist:
+                                    min_dist = dist
+                                    best_match = c_sym
+                                    best_idx = idx
+                                    
+                        if best_match is not None:
+                            claimed_child_indices.add(best_idx)
+                            # If it shifted beyond the threshold, it is Misplaced. Otherwise, IGNORE IT.
+                            if min_dist > dynamic_threshold:
+                                misplaced_box = best_match.copy()
+                                misplaced_box["label"] = "Misplaced"
+                                comp_symbols_final.append(misplaced_box)
                         else:
                             missing_box = base_sym.copy()
                             missing_box["label"] = "Removed"
                             comp_symbols_final.append(missing_box)
-                            
-                    for d in comp_symbols_raw:
-                        if d["class"] not in [b["class"] for b in base_symbols_raw]:
-                            added_box = d.copy()
+
+                    # Any child symbols never claimed by a base symbol are Newly Added
+                    for idx, c_sym in enumerate(comp_symbols_raw):
+                        if idx not in claimed_child_indices:
+                            added_box = c_sym.copy()
                             added_box["label"] = "Added"
                             comp_symbols_final.append(added_box)
                             
@@ -375,15 +466,23 @@ if compare_clicked:
                         elif has_content_b and has_content_c:
                             changed_boxes.append((x, y, w, h))
 
+                    # -------------------------------------------------------------
+                    # FIX: LOGICAL VISUAL RENDERING
+                    # -------------------------------------------------------------
+                    # Separate symbol boxes so "Removed" shows on the Base label, 
+                    # and "Added/Misplaced" show on the Child label. Perfectly matching symbols are ignored!
+                    removed_symbols = [s for s in comp_symbols if s["label"] == "Removed"]
+                    added_misplaced_symbols = [s for s in comp_symbols if s["label"] in ["Added", "Misplaced"]]
+
                     base_marked = draw_differences(base_processed, actual_deleted_boxes, color=(255,0,0), label="Deleted")
-                    # Changed color to Blue (23, 162, 184) and label to "Modified"
                     base_marked = draw_differences(base_marked, changed_boxes, color=(23,162,184), label="Modified")
+                    # Draw "Removed" symbols ONLY on the base image
+                    base_marked = draw_symbol_boxes(base_marked, removed_symbols, color_map={"Removed": (255,0,0)})
                     
                     comp_marked = draw_differences(comp_aligned, actual_added_boxes, color=(0,255,0), label="Added")
-                    # Changed color to Blue (23, 162, 184) and label to "Modified"
                     comp_marked = draw_differences(comp_marked, changed_boxes, color=(23,162,184), label="Modified")
-                    # Updated color_map for "Misplaced" to use Orange (255,165,0)
-                    comp_marked = draw_symbol_boxes(comp_marked, comp_symbols, color_map={"Added": (0,255,0), "Removed": (255,0,0), "Misplaced": (255,165,0)})
+                    # Draw "Added" and "Misplaced" symbols ONLY on the child image
+                    comp_marked = draw_symbol_boxes(comp_marked, added_misplaced_symbols, color_map={"Added": (0,255,0), "Misplaced": (255,165,0)})
 
                     st.markdown("---")
                     st.markdown("### Visual Comparison")
@@ -408,9 +507,6 @@ if compare_clicked:
                         st.markdown("**Child Features**")
                         st.dataframe(comp_features_df, use_container_width=True, hide_index=True)
 
-                    # ---------------------------------------------------------
-                    # THE GOLDEN FIX: VISUALLY-DRIVEN TEXT DISCREPANCIES
-                    # ---------------------------------------------------------
                     added_text = []
                     for box in actual_added_boxes:
                         txt = ocr_crop(comp_aligned, box)
@@ -428,7 +524,6 @@ if compare_clicked:
                         if txt_b or txt_c:
                             modified_text.append(f"From: '{txt_b}' ➔ To: '{txt_c}'")
 
-                    # Get Exact matches for Barcodes and Images (Fuzzy matching disabled for these)
                     added_bc, deleted_bc = get_feature_diffs(base_features_df, comp_features_df, 'Barcode')
                     added_img, deleted_img = get_feature_diffs(base_features_df, comp_features_df, 'Image')
 
