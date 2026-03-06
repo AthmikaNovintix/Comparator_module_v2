@@ -166,7 +166,7 @@ def draw_symbol_boxes(image, detections, color_map=None, thickness=2):
         color_map = {
             "Added": (0,255,0), 
             "Removed": (255,0,0), 
-            "Misplaced": (255,255,0), 
+            "Misplaced": (255,165,0),  # Changed default to Orange
             "Symbol": (0,0,255) 
         }
         
@@ -376,11 +376,14 @@ if compare_clicked:
                             changed_boxes.append((x, y, w, h))
 
                     base_marked = draw_differences(base_processed, actual_deleted_boxes, color=(255,0,0), label="Deleted")
-                    base_marked = draw_differences(base_marked, changed_boxes, color=(255,165,0), label="Changed")
+                    # Changed color to Blue (23, 162, 184) and label to "Modified"
+                    base_marked = draw_differences(base_marked, changed_boxes, color=(23,162,184), label="Modified")
                     
                     comp_marked = draw_differences(comp_aligned, actual_added_boxes, color=(0,255,0), label="Added")
-                    comp_marked = draw_differences(comp_marked, changed_boxes, color=(255,165,0), label="Changed")
-                    comp_marked = draw_symbol_boxes(comp_marked, comp_symbols, color_map={"Added": (0,255,0), "Removed": (255,0,0), "Misplaced": (255,255,0)})
+                    # Changed color to Blue (23, 162, 184) and label to "Modified"
+                    comp_marked = draw_differences(comp_marked, changed_boxes, color=(23,162,184), label="Modified")
+                    # Updated color_map for "Misplaced" to use Orange (255,165,0)
+                    comp_marked = draw_symbol_boxes(comp_marked, comp_symbols, color_map={"Added": (0,255,0), "Removed": (255,0,0), "Misplaced": (255,165,0)})
 
                     st.markdown("---")
                     st.markdown("### Visual Comparison")
